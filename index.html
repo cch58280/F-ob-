@@ -578,6 +578,13 @@ async function moveCompany(id, direction){
 
 async function deleteCompany(id, name){
   if(!confirm(`「${name}」を削除します。所属する社員・口座・入出金・経費・決算情報もすべて削除され、元に戻せません。本当に削除しますか？`)) return;
+
+  const typed = prompt(`最終確認です。本当に削除する場合は、会社名「${name}」をそのまま入力してください。`);
+  if(typed !== name){
+    alert('入力が一致しなかったため、削除を中止しました。');
+    return;
+  }
+
   const { error } = await sb.from('companies').delete().eq('id', id);
   if(error){ alert('削除に失敗しました: '+error.message); return; }
   await loadCompaniesForAdmin();
