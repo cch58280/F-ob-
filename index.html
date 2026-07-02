@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Salt Group | 口座・経費・決算管理</title>
+<title>会社管理 | 口座・経費・決算管理</title>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@500;700&family=Noto+Sans+JP:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
@@ -161,9 +161,24 @@
 
   .empty{color:var(--muted);font-size:13px;padding:14px 0;}
   .muted{color:var(--muted);}
-  .company-picker{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;}
-  .company-picker button{padding:8px 14px;font-size:13px;background:#fff;border:1px solid var(--border);color:var(--ink);}
-  .company-picker button.active{background:var(--ink);color:#fff;}
+  .company-picker{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center;}
+  .company-picker > button{padding:8px 14px;font-size:13px;background:#fff;border:1px solid var(--border);color:var(--ink);}
+  .company-chip{
+    display:flex;align-items:center;gap:2px;
+    background:#fff;border:1px solid var(--border);border-radius:8px;overflow:hidden;
+  }
+  .company-chip.active{background:var(--ink);border-color:var(--ink);}
+  .company-chip.active .chip-label{color:#fff;}
+  .company-chip .chip-label{padding:8px 10px;font-size:13px;cursor:pointer;font-weight:600;color:var(--ink);white-space:nowrap;}
+  .company-chip .chip-arrow, .company-chip .chip-delete{
+    background:transparent;border:none;color:var(--muted);padding:8px 7px;font-size:12px;border-radius:0;
+  }
+  .company-chip.active .chip-arrow{color:rgba(255,255,255,.7);}
+  .company-chip .chip-arrow:hover{color:var(--ink);}
+  .company-chip.active .chip-arrow:hover{color:#fff;}
+  .company-chip .chip-delete:hover{color:var(--negative);}
+  .row-delete{background:transparent;border:none;color:var(--muted);font-size:12px;padding:4px 8px;}
+  .row-delete:hover{color:var(--negative);}
 
   .loss-expiry-warn{color:var(--warn);font-weight:700;}
 </style>
@@ -260,7 +275,7 @@ async function boot(){
 function goGate(){ state.screen='gate'; render(); }
 
 async function goEmployeePick(){
-  const { data, error } = await sb.from('company_directory').select('*').order('name');
+  const { data, error } = await sb.from('company_directory').select('*').order('display_order').order('name');
   state.companies = data || [];
   state.screen = 'emp-company';
   render();
@@ -408,11 +423,15 @@ async function requestWithdrawal(amount, note){
 async function enterAdmin(){
   state.session = { role:'admin' };
   state.screen = 'admin';
-  const { data: companies } = await sb.from('companies').select('*').order('name');
-  state.companies = companies || [];
-  if(companies && companies.length){ state.adminCompanyId = companies[0].id; }
+  await loadCompaniesForAdmin();
+  if(state.companies.length){ state.adminCompanyId = state.companies[0].id; }
   render();
   loadAdminData();
+}
+
+async function loadCompaniesForAdmin(){
+  const { data: companies } = await sb.from('companies').select('*').order('display_order').order('created_at');
+  state.companies = companies || [];
 }
 
 async function loadAdminData(){
@@ -530,12 +549,94 @@ async function addAccount(name, employeeId){
   loadAdminData();
 }
 async function addCompany(name){
-  const { error } = await sb.from('companies').insert({ name });
+  const nextOrder = state.companies.length
+    ? Math.max(...state.companies.map(c=>c.display_order ?? 100)) + 1
+    : 0;
+  const { error } = await sb.from('companies').insert({ name, display_order: nextOrder });
   if(error){ alert('登録に失敗しました: '+error.message); return; }
-  const { data: companies } = await sb.from('companies').select('*').order('name');
-  state.companies = companies || [];
+  await loadCompaniesForAdmin();
   render();
 }
+
+async function moveCompany(id, direction){
+  const list = state.companies;
+  const idx = list.findIndex(c=>c.id===id);
+  const swapIdx = idx + direction;
+  if(idx===-1 || swapIdx<0 || swapIdx>=list.length) return;
+
+  // 現在の並び順を 0,1,2... に正規化しつつ、対象の2件だけ入れ替える
+  const orders = list.map((c,i)=>i);
+  const tmp = orders[idx]; orders[idx] = orders[swapIdx]; orders[swapIdx] = tmp;
+
+  for(let i=0;i<list.length;i++){
+    await sb.from('companies').update({ display_order: orders[i] }).eq('id', list[i].id);
+  }
+  await loadCompaniesForAdmin();
+  render();
+  loadAdminData();
+}
+
+async function deleteCompany(id, name){
+  if(!confirm(`「${name}」を削除します。所属する社員・口座・入出金・経費・決算情報もすべて削除され、元に戻せません。本当に削除しますか？`)) return;
+  const { error } = await sb.from('companies').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  await loadCompaniesForAdmin();
+  if(state.adminCompanyId === id){
+    state.adminCompanyId = state.companies.length ? state.companies[0].id : null;
+  }
+  render();
+  loadAdminData();
+}
+
+async function deleteEmployee(id, name){
+  if(!confirm(`社員「${name}」を削除します。関連する経費・インセンティブ履歴・年次精算記録も削除され、元に戻せません。担当していた口座は「未割当」になります。本当に削除しますか？`)) return;
+  const { error } = await sb.from('employees').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteAccount(id, name){
+  if(!confirm(`口座「${name}」を削除します。残高履歴・入出金履歴も削除され、元に戻せません。本当に削除しますか？`)) return;
+  const { error } = await sb.from('trading_accounts').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteBalance(id){
+  if(!confirm('この残高記録を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('monthly_balances').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteCashflow(id){
+  if(!confirm('この入出金記録を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('account_cashflows').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteExpenseRecord(id){
+  if(!confirm('この経費申請を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('expenses').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteLoss(id){
+  if(!confirm('この繰越欠損金の記録を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('loss_carryforward_vintages').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deletePL(id){
+  if(!confirm('この年度のPL記録を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('company_pl_summary').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
 async function addPL(fields){
   const { error } = await sb.from('company_pl_summary').upsert({
     company_id: state.adminCompanyId,
@@ -688,7 +789,7 @@ function renderGate(){
   app.innerHTML = `
   <div class="gate-wrap">
     <div class="gate-card">
-      <div class="gate-eyebrow">Salt Group</div>
+      <div class="gate-eyebrow">会社管理</div>
       <div class="gate-title">口座・経費・決算管理</div>
       <div class="gate-sub">あなたの役割を選んでください。社員は自分の口座残高の入力と経費申請、管理者は全社の残高・経費承認・決算情報の確認ができます。</div>
       <div class="role-buttons">
@@ -800,7 +901,7 @@ function renderEmployeeDashboard(){
 
   app.innerHTML = `
     <div class="topbar">
-      <div><div class="brand">Salt Group</div><div class="who">${empName} さん</div></div>
+      <div><div class="brand">会社管理</div><div class="who">${empName} さん</div></div>
       <button onclick="logout()">ログアウト</button>
     </div>
     <div class="container">
@@ -847,8 +948,13 @@ function renderEmployeeDashboard(){
    レンダリング: 管理者ダッシュボード
 ===================================================================== */
 function renderAdminDashboard(){
-  const companyPicker = state.companies.map(c =>
-    `<button class="${c.id===state.adminCompanyId?'active':''}" onclick="switchAdminCompany('${c.id}')">${c.name}</button>`
+  const companyPicker = state.companies.map((c,i) => `
+    <div class="company-chip ${c.id===state.adminCompanyId?'active':''}">
+      <button class="chip-arrow" ${i===0?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',-1)" title="左に移動">◀</button>
+      <span class="chip-label" onclick="switchAdminCompany('${c.id}')">${c.name}</span>
+      <button class="chip-arrow" ${i===state.companies.length-1?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',1)" title="右に移動">▶</button>
+      <button class="chip-delete" onclick="deleteCompany('${c.id}','${c.name}')" title="この会社を削除">✕</button>
+    </div>`
   ).join('');
 
   const tabs = [
@@ -864,7 +970,7 @@ function renderAdminDashboard(){
 
   app.innerHTML = `
     <div class="topbar">
-      <div><div class="brand">Salt Group</div><div class="who">管理者モード</div></div>
+      <div><div class="brand">会社管理</div><div class="who">管理者モード</div></div>
       <button onclick="logout()">ログアウト</button>
     </div>
     <div class="container">
@@ -907,17 +1013,24 @@ function adminAccountsHtml(){
       <td>${employeesById[acc.employee_id] || '未割当'}</td>
       <td class="num">${latest ? yen(latest.balance) : '—'}</td>
       <td>${latest ? ym(latest.year_month) : '—'}</td>
+      <td><button class="row-delete" onclick="deleteAccount('${acc.id}','${acc.account_name}')">削除</button></td>
     </tr>`;
-  }).join('') || `<tr><td colspan="4" class="empty">口座がまだ登録されていません</td></tr>`;
+  }).join('') || `<tr><td colspan="5" class="empty">口座がまだ登録されていません</td></tr>`;
 
   const empOptions = (state.adminEmployees||[]).map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+
+  const empRows = (state.adminEmployees||[]).map(emp => `<tr>
+    <td>${emp.name}</td>
+    <td class="num">${yen(emp.monthly_salary)}</td>
+    <td><button class="row-delete" onclick="deleteEmployee('${emp.id}','${emp.name}')">削除</button></td>
+  </tr>`).join('') || `<tr><td colspan="3" class="empty">社員が登録されていません</td></tr>`;
 
   return `
   <div class="card">
     <h2>口座残高一覧</h2>
-    <div class="desc">各口座の最新残高です。過去推移は今後、行クリックで展開する形に拡張できます。</div>
+    <div class="desc">各口座の最新残高です。過去の推移は「口座管理」タブでグラフ・明細を確認できます。</div>
     <table>
-      <thead><tr><th>口座名</th><th>担当社員</th><th class="num">最新残高</th><th>対象月</th></tr></thead>
+      <thead><tr><th>口座名</th><th>担当社員</th><th class="num">最新残高</th><th>対象月</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <div class="form-inline">
@@ -927,7 +1040,11 @@ function adminAccountsHtml(){
     </div>
   </div>
   <div class="card">
-    <h2>社員登録</h2>
+    <h2>社員一覧・登録</h2>
+    <table>
+      <thead><tr><th>氏名</th><th class="num">月給</th><th></th></tr></thead>
+      <tbody>${empRows}</tbody>
+    </table>
     <div class="form-inline">
       <div><label>氏名</label><input type="text" id="new-emp-name" placeholder="例: 佐藤 花子" /></div>
       <div><label>月給</label><input type="number" id="new-emp-salary" placeholder="例: 300000" /></div>
@@ -953,7 +1070,8 @@ function adminCashflowSectionHtml(){
     <td class="num" style="color:${cf.amount<0?'var(--negative)':'var(--positive)'}">${cf.amount<0?'−':'+'}${yen(Math.abs(cf.amount))}</td>
     <td>${categoryLabel[cf.category]||cf.category}</td>
     <td class="muted">${cf.note||''}</td>
-  </tr>`).join('') || `<tr><td colspan="4" class="empty">入出金の記録はまだありません</td></tr>`;
+    <td><button class="row-delete" onclick="deleteCashflow('${cf.id}')">削除</button></td>
+  </tr>`).join('') || `<tr><td colspan="5" class="empty">入出金の記録はまだありません</td></tr>`;
 
   return `
   <div class="card">
@@ -964,7 +1082,7 @@ function adminCashflowSectionHtml(){
       <select onchange="state.selectedCashflowAccountId=this.value; renderAdminTabContent();">${accOptions}</select>
     </div>
     <table>
-      <thead><tr><th>日付</th><th class="num">金額</th><th>区分</th><th>メモ</th></tr></thead>
+      <thead><tr><th>日付</th><th class="num">金額</th><th>区分</th><th>メモ</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <div class="form-inline">
@@ -1127,7 +1245,7 @@ function adminExpensesHtml(){
       actions = '';
     } else if(e.status==='rejected'){
       badge = '<span class="badge badge-rejected">却下</span>';
-      actions = '';
+      actions = `<button class="row-delete" onclick="deleteExpenseRecord('${e.id}')">削除</button>`;
     } else {
       badge = '<span class="badge badge-pending">申請中</span>';
       const available = incentiveAvailable(employeeIncentiveLedger(e.employee_id));
@@ -1135,7 +1253,8 @@ function adminExpensesHtml(){
       actions = `
         <button class="btn-approve" onclick="approveExpense('${e.id}','company')">承認(会社)</button>
         <button class="btn-approve" style="background:var(--accent)" ${canUseIncentive?'':'disabled title="インセンティブ残高不足"'} onclick="approveExpense('${e.id}','incentive')">承認(インセンティブ)</button>
-        <button class="btn-reject" onclick="rejectExpense('${e.id}')">却下</button>`;
+        <button class="btn-reject" onclick="rejectExpense('${e.id}')">却下</button>
+        <button class="row-delete" onclick="deleteExpenseRecord('${e.id}')">削除</button>`;
     }
     return `<tr>
       <td>${employeesById[e.employee_id]||'—'}</td>
@@ -1310,6 +1429,9 @@ function adminPLHtml(){
         <div class="stat"><div class="label">繰越欠損金を使い切った場合の想定税引後利益</div><div class="value">${yen(netAfterTaxEstimate)}</div></div>
       </div>
       ${p.notes ? `<div class="desc" style="margin-top:12px;">${p.notes}</div>` : ''}
+      <div style="margin-top:14px;">
+        <button class="row-delete" onclick="deletePL('${p.id}')">この年度のPLを削除</button>
+      </div>
     </div>`;
   }).join('') || `<div class="card"><p class="empty">この会社の簡易PLはまだ登録されていません。</p></div>`;
 
@@ -1370,8 +1492,9 @@ function adminLossHtml(){
       <td class="num"><strong>${yen(l.remaining_amount)}</strong></td>
       <td class="${soon?'loss-expiry-warn':''}">${l.expiry_fiscal_year_end || '—'}${soon?' ⚠︎期限間近':''}</td>
       <td class="muted">${l.source_document||''}</td>
+      <td><button class="row-delete" onclick="deleteLoss('${l.id}')">削除</button></td>
     </tr>`;
-  }).join('') || `<tr><td colspan="6" class="empty">繰越欠損金データはまだ登録されていません</td></tr>`;
+  }).join('') || `<tr><td colspan="7" class="empty">繰越欠損金データはまだ登録されていません</td></tr>`;
 
   const total = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
 
@@ -1382,7 +1505,7 @@ function adminLossHtml(){
   <div class="card">
     <h2>発生年度別の内訳</h2>
     <table>
-      <thead><tr><th>発生事業年度</th><th class="num">発生額</th><th class="num">控除済み累計</th><th class="num">繰越残額</th><th>失効期限</th><th>出典</th></tr></thead>
+      <thead><tr><th>発生事業年度</th><th class="num">発生額</th><th class="num">控除済み累計</th><th class="num">繰越残額</th><th>失効期限</th><th>出典</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </div>
