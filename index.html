@@ -189,6 +189,19 @@
 
   .loss-expiry-warn{color:var(--warn);font-weight:700;}
 
+  /* --- 口座管理タブ: コンパクトなツールバーとチャート --- */
+  .chart-toolbar{display:flex;gap:8px;margin-bottom:14px;align-items:center;}
+  .chart-account-select{flex:1;max-width:300px;font-weight:600;}
+  .period-toggle{display:flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;flex-shrink:0;}
+  .period-toggle button{
+    background:#fff;color:var(--muted);border:none;border-radius:0;
+    padding:9px 16px;font-size:13px;
+  }
+  .period-toggle button.active{background:var(--ink);color:#fff;}
+  .chart-card h3{font-size:14.5px;margin-bottom:12px;}
+  .chart-sub{font-weight:400;font-size:12px;color:var(--muted);margin-left:6px;}
+  .chart-box{position:relative;height:300px;}
+
   /* --- テーブルはカード内で横スクロール可能に --- */
   .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
 
@@ -231,7 +244,12 @@
     .gate-card{padding:28px 20px;}
     .wave{margin:18px 0;}
 
-    canvas{max-height:220px;}
+    /* 口座管理タブ */
+    .chart-account-select{max-width:none;}
+    .period-toggle button{padding:8px 13px;font-size:12.5px;}
+    .chart-box{height:230px;}
+    .chart-card{padding:14px 10px;}
+    .chart-card h3{font-size:13.5px;margin-bottom:8px;padding-left:4px;}
   }
 </style>
 </head>
@@ -1337,6 +1355,42 @@ function adminCashflowSectionHtml(){
   </div>`;
 }
 
+/* 年次集計: monthlySeriesを会社の期首月で年度グルーピング */
+function yearlySeriesForAccount(accountId){
+  const company = state.companies.find(c=>c.id===state.adminCompanyId);
+  const fsm = company?.fiscal_year_start_month || 4;
+  const monthly = monthlySeriesForAccount(accountId);
+  const groups = {};
+  monthly.forEach(s => {
+    const y = Number(s.year_month.slice(0,4));
+    const m = Number(s.year_month.slice(5,7));
+    const fiscalStartYear = m >= fsm ? y : y - 1;
+    if(!groups[fiscalStartYear]) groups[fiscalStartYear] = { items: [] };
+    groups[fiscalStartYear].items.push(s);
+  });
+  return Object.keys(groups).sort().map(fy => {
+    const items = groups[fy].items;
+    const last = items[items.length-1];
+    const cashflow = items.reduce((s,i)=>s+i.cashflow,0);
+    const profit = items.reduce((s,i)=> i.profit==null ? s : s+i.profit, 0);
+    const endMonth = fsm === 1 ? 12 : fsm - 1;
+    const endYear = fsm === 1 ? Number(fy) : Number(fy)+1;
+    return {
+      label: `${fy}/${fsm}〜${endYear}/${endMonth}期`,
+      balance: last.balance,   // 年度末(最新)残高
+      cashflow, profit
+    };
+  });
+}
+
+function chartSeries(){
+  const period = state.chartPeriod || 'monthly';
+  if(period === 'yearly'){
+    return yearlySeriesForAccount(state.selectedChartAccountId).map(s=>({ ...s }));
+  }
+  return monthlySeriesForAccount(state.selectedChartAccountId).map(s=>({ ...s, label: ym(s.year_month) }));
+}
+
 function adminChartHtml(){
   const accounts = state.adminAccounts || [];
   if(!accounts.length){
@@ -1345,8 +1399,10 @@ function adminChartHtml(){
   if(!state.selectedChartAccountId || !accounts.find(a=>a.id===state.selectedChartAccountId)){
     state.selectedChartAccountId = accounts[0].id;
   }
+  if(!state.chartPeriod) state.chartPeriod = 'monthly';
   const accOptions = accounts.map(a=>`<option value="${a.id}" ${a.id===state.selectedChartAccountId?'selected':''}>${a.account_name}</option>`).join('');
   const series = monthlySeriesForAccount(state.selectedChartAccountId);
+  const periodLabel = state.chartPeriod==='yearly' ? '年次' : '月次';
 
   const rows = series.slice().reverse().map(s => `<tr>
     <td>${ym(s.year_month)}</td>
@@ -1360,24 +1416,23 @@ function adminChartHtml(){
   </tr>`).join('') || `<tr><td colspan="5" class="empty">残高データがありません</td></tr>`;
 
   return `
-  <div class="card">
-    <h2>口座管理</h2>
-    <div class="desc">口座残高の推移と月次の投資収益をまとめて確認できます。残高推移グラフの棒はその月の入出金額です。</div>
-    <div class="field-group" style="max-width:320px;">
-      <label>対象口座</label>
-      <select onchange="state.selectedChartAccountId=this.value; renderAdminTabContent();">${accOptions}</select>
+  <div class="chart-toolbar">
+    <select class="chart-account-select" onchange="state.selectedChartAccountId=this.value; renderAdminTabContent();">${accOptions}</select>
+    <div class="period-toggle">
+      <button class="${state.chartPeriod==='monthly'?'active':''}" onclick="state.chartPeriod='monthly'; renderAdminTabContent();">月次</button>
+      <button class="${state.chartPeriod==='yearly'?'active':''}" onclick="state.chartPeriod='yearly'; renderAdminTabContent();">年次</button>
     </div>
   </div>
-  <div class="card">
-    <h3 style="margin-bottom:14px;">残高推移(棒 = その月の入出金額)</h3>
-    <canvas id="balance-chart" height="90"></canvas>
+  <div class="card chart-card">
+    <h3>残高推移<span class="chart-sub">(棒 = ${periodLabel}の入出金)</span></h3>
+    <div class="chart-box"><canvas id="balance-chart"></canvas></div>
+  </div>
+  <div class="card chart-card">
+    <h3>${periodLabel}投資収益<span class="chart-sub">(入出金調整後)</span></h3>
+    <div class="chart-box"><canvas id="profit-chart"></canvas></div>
   </div>
   <div class="card">
-    <h3 style="margin-bottom:14px;">月次投資収益(入出金調整後)</h3>
-    <canvas id="profit-chart" height="90"></canvas>
-  </div>
-  <div class="card">
-    <h3 style="margin-bottom:14px;">明細</h3>
+    <h3 style="margin-bottom:14px;">明細(月次)</h3>
     <table>
       <thead><tr><th>年月</th><th class="num">残高</th><th class="num">その月の入出金</th><th class="num">投資収益</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
@@ -1385,14 +1440,33 @@ function adminChartHtml(){
   </div>`;
 }
 
+/* 金額の軸ラベルを「万」単位で短縮 */
+function yenShort(v){
+  const n = Number(v);
+  if(Math.abs(n) >= 100000000) return (n/100000000).toLocaleString('ja-JP', {maximumFractionDigits:1}) + '億';
+  if(Math.abs(n) >= 10000) return (n/10000).toLocaleString('ja-JP', {maximumFractionDigits:0}) + '万';
+  return n.toLocaleString('ja-JP');
+}
+
 function drawAccountCharts(){
   if(!window.Chart) return;
-  const series = monthlySeriesForAccount(state.selectedChartAccountId);
-  const labels = series.map(s=>ym(s.year_month));
+  const series = chartSeries();
+  const labels = series.map(s=>s.label);
+  const isMobile = window.innerWidth <= 640;
 
   state.charts = state.charts || {};
   if(state.charts.balance){ state.charts.balance.destroy(); state.charts.balance = null; }
   if(state.charts.profit){ state.charts.profit.destroy(); state.charts.profit = null; }
+
+  const commonTicks = {
+    font: { size: isMobile ? 10 : 12 },
+  };
+  const xTicks = {
+    ...commonTicks,
+    autoSkip: true,
+    maxTicksLimit: isMobile ? 6 : 12,
+    maxRotation: isMobile ? 45 : 0,
+  };
 
   const balanceCanvas = document.getElementById('balance-chart');
   if(balanceCanvas){
@@ -1402,24 +1476,30 @@ function drawAccountCharts(){
         datasets: [
           {
             type:'bar', label:'入出金', data: series.map(s=>s.cashflow),
-            backgroundColor: series.map(s=> s.cashflow<0 ? 'rgba(180,83,61,0.55)' : 'rgba(63,143,95,0.55)'),
+            backgroundColor: series.map(s=> s.cashflow<0 ? 'rgba(180,83,61,0.6)' : 'rgba(63,143,95,0.6)'),
             yAxisID:'y1', order:2
           },
           {
             type:'line', label:'残高', data: series.map(s=>s.balance),
-            borderColor:'#1C2B39', backgroundColor:'#1C2B39', pointRadius:3, tension:0.25,
+            borderColor:'#1C2B39', backgroundColor:'#1C2B39',
+            pointRadius: isMobile ? 2.5 : 3, borderWidth: isMobile ? 2 : 3, tension:0.25,
             yAxisID:'y', order:1
           }
         ]
       },
       options: {
         responsive:true,
+        maintainAspectRatio:false,
         interaction:{ mode:'index', intersect:false },
         scales: {
-          y: { position:'left', ticks:{ callback:v=>Number(v).toLocaleString('ja-JP') } },
-          y1:{ position:'right', grid:{ drawOnChartArea:false }, ticks:{ callback:v=>Number(v).toLocaleString('ja-JP') } }
+          x: { ticks: xTicks, grid:{ display:false } },
+          y: { position:'left', ticks:{ ...commonTicks, callback:yenShort, maxTicksLimit: isMobile ? 5 : 8 } },
+          y1:{ position:'right', grid:{ drawOnChartArea:false }, ticks:{ ...commonTicks, callback:yenShort, maxTicksLimit: isMobile ? 4 : 6 } }
         },
-        plugins: { legend:{ position:'bottom' } }
+        plugins: {
+          legend:{ position:'bottom', labels:{ font:{ size: isMobile ? 11 : 12 }, boxWidth: 14 } },
+          tooltip:{ callbacks:{ label: ctx => `${ctx.dataset.label}: ${yen(ctx.raw)}` } }
+        }
       }
     });
   }
@@ -1431,15 +1511,22 @@ function drawAccountCharts(){
       data: {
         labels,
         datasets: [{
-          label:'月次投資収益',
+          label:'投資収益',
           data: series.map(s=>s.profit),
           backgroundColor: series.map(s => (s.profit||0) < 0 ? '#B4533D' : '#2F7A6B')
         }]
       },
       options: {
         responsive:true,
-        scales: { y:{ ticks:{ callback:v=>Number(v).toLocaleString('ja-JP') } } },
-        plugins:{ legend:{ display:false } }
+        maintainAspectRatio:false,
+        scales: {
+          x: { ticks: xTicks, grid:{ display:false } },
+          y: { ticks:{ ...commonTicks, callback:yenShort, maxTicksLimit: isMobile ? 5 : 8 } }
+        },
+        plugins:{
+          legend:{ display:false },
+          tooltip:{ callbacks:{ label: ctx => `投資収益: ${yen(ctx.raw)}` } }
+        }
       }
     });
   }
