@@ -391,6 +391,23 @@ async function addBalance(accountId, yearMonthValue, amount){
   loadEmployeeData();
 }
 
+async function editBalanceEmployee(id, currentValue){
+  const input = prompt('新しい残高を入力してください', currentValue);
+  if(input === null) return;
+  const amount = Number(input);
+  if(Number.isNaN(amount)){ alert('数値を入力してください'); return; }
+  const { error } = await sb.from('monthly_balances').update({ balance: amount }).eq('id', id);
+  if(error){ alert('更新に失敗しました: '+error.message); return; }
+  loadEmployeeData();
+}
+
+async function deleteBalanceEmployee(id){
+  if(!confirm('この残高記録を削除します。よろしいですか？')) return;
+  const { error } = await sb.from('monthly_balances').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadEmployeeData();
+}
+
 async function addExpense(date, amount, description){
   const { error } = await sb.from('expenses').insert({
     employee_id: state.session.employeeId,
@@ -420,6 +437,30 @@ async function requestWithdrawal(amount, note){
 /* =====================================================================
    管理者ダッシュボード
 ===================================================================== */
+async function downloadBackup(){
+  const tables = [
+    'companies','employees','trading_accounts','monthly_balances',
+    'expenses','account_cashflows','incentive_ledger','annual_settlements',
+    'company_pl_summary','loss_carryforward_vintages'
+  ];
+  const backup = { exported_at: new Date().toISOString() };
+  for(const t of tables){
+    const { data, error } = await sb.from(t).select('*');
+    if(error){ alert(`バックアップに失敗しました(${t}): ${error.message}`); return; }
+    backup[t] = data || [];
+  }
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().slice(0,10);
+  a.href = url;
+  a.download = `salt-group-backup-${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 async function enterAdmin(){
   state.session = { role:'admin' };
   state.screen = 'admin';
@@ -616,6 +657,16 @@ async function deleteBalance(id){
   loadAdminData();
 }
 
+async function editBalance(id, currentValue){
+  const input = prompt('新しい残高を入力してください', currentValue);
+  if(input === null) return;
+  const amount = Number(input);
+  if(Number.isNaN(amount)){ alert('数値を入力してください'); return; }
+  const { error } = await sb.from('monthly_balances').update({ balance: amount }).eq('id', id);
+  if(error){ alert('更新に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
 async function deleteCashflow(id){
   if(!confirm('この入出金記録を削除します。よろしいですか？')) return;
   const { error } = await sb.from('account_cashflows').delete().eq('id', id);
@@ -691,11 +742,24 @@ async function decideWithdrawal(id, decision){
 
 /* ---------------------------------------------------------------------
    投資収益の計算（残高の増減 − 入出金）
+   注意: 月次残高は「その月の1日」として保存されているが、意味としては
+   「その月末時点の残高」を表す。比較の基準もすべて月末日にそろえることで、
+   月の途中に発生した入出金が翌月分として誤集計されるのを防ぐ。
 --------------------------------------------------------------------- */
+function monthEndDate(yearMonthStr){
+  const year = Number(yearMonthStr.slice(0,4));
+  const month = Number(yearMonthStr.slice(5,7)); // 1-12
+  const last = new Date(Date.UTC(year, month, 0)); // 翌月の0日目 = 当月末日
+  return last.toISOString().slice(0,10);
+}
+
 function accountProfitForPeriod(accountId, startDate, endDate){
   const balances = (state.adminBalances[accountId]||[]).slice().sort((a,b)=> a.year_month.localeCompare(b.year_month));
-  const before = balances.filter(b=>b.year_month <= startDate);
-  const within = balances.filter(b=>b.year_month > startDate && b.year_month <= endDate);
+  const before = balances.filter(b=>monthEndDate(b.year_month) <= startDate);
+  const within = balances.filter(b=>{
+    const me = monthEndDate(b.year_month);
+    return me > startDate && me <= endDate;
+  });
   const startBalance = before.length ? Number(before[before.length-1].balance) : 0;
   const endBalance = within.length ? Number(within[within.length-1].balance) : startBalance;
 
@@ -718,15 +782,16 @@ function monthlySeriesForAccount(accountId){
   const cashflows = (state.adminCashflows[accountId]||[]).slice().sort((a,b)=>a.flow_date.localeCompare(b.flow_date));
   const series = [];
   let prevBalance = null;
-  let prevDate = null;
+  let prevBoundary = null;
   balances.forEach(b => {
+    const boundary = monthEndDate(b.year_month);
     const cfSum = cashflows
-      .filter(cf => (!prevDate || cf.flow_date > prevDate) && cf.flow_date <= b.year_month)
+      .filter(cf => (!prevBoundary || cf.flow_date > prevBoundary) && cf.flow_date <= boundary)
       .reduce((s,cf)=>s+Number(cf.amount), 0);
     const profit = prevBalance===null ? null : (Number(b.balance) - prevBalance) - cfSum;
-    series.push({ year_month: b.year_month, balance: Number(b.balance), cashflow: cfSum, profit });
+    series.push({ id: b.id, year_month: b.year_month, balance: Number(b.balance), cashflow: cfSum, profit });
     prevBalance = Number(b.balance);
-    prevDate = b.year_month;
+    prevBoundary = boundary;
   });
   return series;
 }
@@ -868,14 +933,21 @@ function renderEmployeeDashboard(){
 
   const accountsHtml = accounts.map(acc => {
     const balances = state.myBalances[acc.id] || [];
-    const rows = balances.map(b => `<tr><td>${ym(b.year_month)}</td><td class="num">${yen(b.balance)}</td></tr>`).join('')
-      || `<tr><td colspan="2" class="empty">まだ入力がありません</td></tr>`;
+    const rows = balances.map(b => `<tr>
+      <td>${ym(b.year_month)}</td>
+      <td class="num">${yen(b.balance)}</td>
+      <td>
+        <button class="row-delete" onclick="editBalanceEmployee('${b.id}', ${b.balance})">編集</button>
+        <button class="row-delete" onclick="deleteBalanceEmployee('${b.id}')">削除</button>
+      </td>
+    </tr>`).join('')
+      || `<tr><td colspan="3" class="empty">まだ入力がありません</td></tr>`;
     return `
     <div class="card">
       <h2>${acc.account_name}</h2>
       <div class="desc">月末残高の推移</div>
       <table>
-        <thead><tr><th>年月</th><th class="num">残高</th></tr></thead>
+        <thead><tr><th>年月</th><th class="num">残高</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <div class="form-inline">
@@ -978,7 +1050,10 @@ function renderAdminDashboard(){
   app.innerHTML = `
     <div class="topbar">
       <div><div class="brand">会社管理</div><div class="who">管理者モード</div></div>
-      <button onclick="logout()">ログアウト</button>
+      <div style="display:flex;gap:8px;">
+        <button onclick="downloadBackup()">バックアップをダウンロード</button>
+        <button onclick="logout()">ログアウト</button>
+      </div>
     </div>
     <div class="container">
       <div class="company-picker">
@@ -1125,7 +1200,11 @@ function adminChartHtml(){
     <td class="num">${yen(s.balance)}</td>
     <td class="num" style="color:${s.cashflow<0?'var(--negative)':(s.cashflow>0?'var(--positive)':'inherit')}">${s.cashflow!==0 ? (s.cashflow>0?'+':'−')+yen(Math.abs(s.cashflow)) : '—'}</td>
     <td class="num" style="color:${s.profit==null?'inherit':(s.profit<0?'var(--negative)':'var(--positive)')}">${s.profit==null?'—':(s.profit<0?'−':'+')+yen(Math.abs(s.profit))}</td>
-  </tr>`).join('') || `<tr><td colspan="4" class="empty">残高データがありません</td></tr>`;
+    <td>
+      <button class="row-delete" onclick="editBalance('${s.id}', ${s.balance})">編集</button>
+      <button class="row-delete" onclick="deleteBalance('${s.id}')">削除</button>
+    </td>
+  </tr>`).join('') || `<tr><td colspan="5" class="empty">残高データがありません</td></tr>`;
 
   return `
   <div class="card">
@@ -1147,7 +1226,7 @@ function adminChartHtml(){
   <div class="card">
     <h3 style="margin-bottom:14px;">明細</h3>
     <table>
-      <thead><tr><th>年月</th><th class="num">残高</th><th class="num">その月の入出金</th><th class="num">投資収益</th></tr></thead>
+      <thead><tr><th>年月</th><th class="num">残高</th><th class="num">その月の入出金</th><th class="num">投資収益</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </div>`;
