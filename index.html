@@ -354,9 +354,12 @@ async function loadEmployeeData(){
   state.myAccounts = accounts || [];
 
   state.myBalances = {};
+  state.myCashflows = {};
   for(const acc of state.myAccounts){
     const { data: balances } = await sb.from('monthly_balances').select('*').eq('account_id', acc.id).order('year_month', {ascending:false});
     state.myBalances[acc.id] = balances || [];
+    const { data: cfs } = await sb.from('account_cashflows').select('*').eq('account_id', acc.id).order('flow_date', {ascending:false});
+    state.myCashflows[acc.id] = cfs || [];
   }
 
   const { data: expenses } = await sb.from('expenses').select('*').eq('employee_id', employeeId).order('created_at', {ascending:false});
@@ -367,6 +370,9 @@ async function loadEmployeeData(){
 
   const { data: settlements } = await sb.from('annual_settlements').select('*').eq('employee_id', employeeId).order('fiscal_year_end', {ascending:false});
   state.mySettlements = settlements || [];
+
+  const { data: salary } = await sb.rpc('get_my_salary');
+  state.mySalary = salary ?? 0;
 
   renderEmployeeDashboard();
 }
@@ -379,6 +385,78 @@ function incentivePendingWithdrawals(ledgerEntries){
 }
 function incentiveAvailable(ledgerEntries){
   return incentiveBalance(ledgerEntries) - incentivePendingWithdrawals(ledgerEntries);
+}
+
+/* ---------------------------------------------------------------------
+   見込みインセンティブの自動計算(汎用)
+   - 対象期間: 最後に確定した年次精算の期末翌日 〜 現在
+     (確定精算がなければ、最初の残高記録の月から)
+   - 給与コスト: 期間の経過月数 × 月給
+   - 税は未確定要素のため見込みには含めない(注記で伝える)
+   - DBには保存せず、常に最新の残高・入出金から算出するため、
+     残高の修正・削除にも自動で追従する
+--------------------------------------------------------------------- */
+function estimateCurrentSettlement(accounts, balancesByAccount, cashflowsByAccount, monthlySalary, settlements, splitRate){
+  splitRate = splitRate ?? 0.5;
+  const settled = (settlements||[]).slice().sort((a,b)=>b.fiscal_year_end.localeCompare(a.fiscal_year_end));
+  const periodStart = settled.length ? settled[0].fiscal_year_end : null; // この日「まで」は精算済み
+
+  // 期間開始: 精算済みならその期末、なければ最初の残高記録の月末
+  // (最初の残高は元手=期首残高として扱い、投資収益に誤カウントしない)
+  let startDate = periodStart;
+  if(!startDate){
+    let earliest = null;
+    for(const acc of accounts){
+      const bs = balancesByAccount[acc.id]||[];
+      for(const b of bs){
+        if(!earliest || b.year_month < earliest) earliest = b.year_month;
+      }
+    }
+    if(!earliest) return null; // 残高データなし
+    startDate = monthEndDate(earliest);
+  }
+
+  const today = new Date().toISOString().slice(0,10);
+
+  let profit = 0;
+  let hasData = false;
+  for(const acc of accounts){
+    const bs = balancesByAccount[acc.id]||[];
+    const cfs = cashflowsByAccount[acc.id]||[];
+    const within = bs.filter(b=>{
+      const me = monthEndDate(b.year_month);
+      return me > startDate && me <= today;
+    });
+    if(within.length) hasData = true;
+    profit += accountProfitForPeriodGeneric(bs, cfs, startDate, today);
+  }
+  if(!hasData) return null;
+
+  // 経過月数(開始月の翌月から現在の月まで)
+  const sy = Number(startDate.slice(0,4)), sm = Number(startDate.slice(5,7));
+  const now = new Date();
+  const months = Math.max(1, (now.getUTCFullYear()-sy)*12 + (now.getUTCMonth()+1-sm));
+  const salaryCost = Number(monthlySalary||0) * months;
+
+  const distributable = profit - salaryCost;
+  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;
+
+  return { startDate, months, profit, salaryCost, distributable, employeeAmount };
+}
+
+// accountProfitForPeriodの汎用版(state非依存で、任意のデータを渡せる)
+function accountProfitForPeriodGeneric(balances, cashflows, startDate, endDate){
+  const sorted = (balances||[]).slice().sort((a,b)=> a.year_month.localeCompare(b.year_month));
+  const before = sorted.filter(b=>monthEndDate(b.year_month) <= startDate);
+  const within = sorted.filter(b=>{
+    const me = monthEndDate(b.year_month);
+    return me > startDate && me <= endDate;
+  });
+  const startBalance = before.length ? Number(before[before.length-1].balance) : 0;
+  const endBalance = within.length ? Number(within[within.length-1].balance) : startBalance;
+  const cfs = (cashflows||[]).filter(cf => cf.flow_date > startDate && cf.flow_date <= endDate);
+  const netCashflow = cfs.reduce((s,cf)=>s+Number(cf.amount), 0);
+  return (endBalance - startBalance) - netCashflow;
 }
 
 async function addBalance(accountId, yearMonthValue, amount){
@@ -589,11 +667,14 @@ async function addAccount(name, employeeId){
   if(error){ alert('登録に失敗しました: '+error.message); return; }
   loadAdminData();
 }
-async function addCompany(name){
+async function addCompany(name, fiscalStartMonth){
   const nextOrder = state.companies.length
     ? Math.max(...state.companies.map(c=>c.display_order ?? 100)) + 1
     : 0;
-  const { error } = await sb.from('companies').insert({ name, display_order: nextOrder });
+  const { error } = await sb.from('companies').insert({
+    name, display_order: nextOrder,
+    fiscal_year_start_month: fiscalStartMonth || 4
+  });
   if(error){ alert('登録に失敗しました: '+error.message); return; }
   await loadCompaniesForAdmin();
   render();
@@ -754,19 +835,11 @@ function monthEndDate(yearMonthStr){
 }
 
 function accountProfitForPeriod(accountId, startDate, endDate){
-  const balances = (state.adminBalances[accountId]||[]).slice().sort((a,b)=> a.year_month.localeCompare(b.year_month));
-  const before = balances.filter(b=>monthEndDate(b.year_month) <= startDate);
-  const within = balances.filter(b=>{
-    const me = monthEndDate(b.year_month);
-    return me > startDate && me <= endDate;
-  });
-  const startBalance = before.length ? Number(before[before.length-1].balance) : 0;
-  const endBalance = within.length ? Number(within[within.length-1].balance) : startBalance;
-
-  const cashflows = (state.adminCashflows[accountId]||[]).filter(cf => cf.flow_date > startDate && cf.flow_date <= endDate);
-  const netCashflow = cashflows.reduce((s,cf)=>s+Number(cf.amount), 0);
-
-  return (endBalance - startBalance) - netCashflow;
+  return accountProfitForPeriodGeneric(
+    state.adminBalances[accountId]||[],
+    state.adminCashflows[accountId]||[],
+    startDate, endDate
+  );
 }
 
 function employeeInvestmentProfit(employeeId, startDate, endDate){
@@ -969,6 +1042,19 @@ function renderEmployeeDashboard(){
   const ledger = state.myIncentiveLedger || [];
   const balance = incentiveBalance(ledger);
   const available = incentiveAvailable(ledger);
+
+  const estimate = estimateCurrentSettlement(
+    state.myAccounts||[], state.myBalances||{}, state.myCashflows||{},
+    state.mySalary||0, state.mySettlements||[], 0.5
+  );
+  const estimateHtml = estimate ? `
+        <div class="row" style="margin-top:16px;padding-top:16px;border-top:1px dashed var(--border);">
+          <div class="stat"><div class="label">今期の投資収益(入出金調整後)</div><div class="value ${estimate.profit<0?'negative':'positive'}">${yen(estimate.profit)}</div></div>
+          <div class="stat"><div class="label">固定給コスト(${estimate.months}ヶ月分)</div><div class="value">${yen(estimate.salaryCost)}</div></div>
+          <div class="stat"><div class="label">見込みインセンティブ(折半後)</div><div class="value ${estimate.employeeAmount<0?'negative':'positive'}">${yen(Math.round(estimate.employeeAmount))}</div></div>
+        </div>
+        <div class="desc" style="margin-top:10px;">※ 見込みは残高・入出金の入力に応じて自動計算される暫定値です(法人税は未確定のため含まれません)。決算締めの年次精算で確定するまで残高には加算されません。</div>` : '';
+
   const typeLabel = { annual_settlement:'年次精算', withdrawal:'引き出し', expense_payment:'経費充当' };
   const statusLabel = { pending:'申請中', completed:'完了', rejected:'取消' };
   const ledgerRows = ledger.slice(0,20).map(e => `<tr>
@@ -990,10 +1076,11 @@ function renderEmployeeDashboard(){
         <h2>インセンティブ</h2>
         <div class="desc">年次精算で確定した取り分が蓄積されます。任意のタイミングで引き出し申請ができます(承認は経理担当者が行います)。</div>
         <div class="row">
-          <div class="stat"><div class="label">現在の残高</div><div class="value ${balance<0?'negative':'positive'}" style="font-size:26px">${yen(balance)}</div></div>
+          <div class="stat"><div class="label">現在の残高(確定分)</div><div class="value ${balance<0?'negative':'positive'}" style="font-size:26px">${yen(balance)}</div></div>
           <div class="stat"><div class="label">引き出し申請中</div><div class="value">${yen(balance-available)}</div></div>
           <div class="stat"><div class="label">引き出し可能額</div><div class="value">${yen(available)}</div></div>
         </div>
+        ${estimateHtml}
         <table style="margin-top:16px;">
           <thead><tr><th>日付</th><th>種別</th><th class="num">金額</th><th>状態</th></tr></thead>
           <tbody>${ledgerRows}</tbody>
@@ -1069,7 +1156,11 @@ function renderAdminDashboard(){
 
 function promptAddCompany(){
   const name = prompt('会社名を入力してください');
-  if(name) addCompany(name);
+  if(!name) return;
+  const monthInput = prompt('決算期の期首月を数字で入力してください(例: 5月開始なら「5」)', '4');
+  const month = Number(monthInput);
+  if(!month || month < 1 || month > 12){ alert('1〜12の数字を入力してください'); return; }
+  addCompany(name, month);
 }
 
 function renderAdminTabContent(){
@@ -1370,12 +1461,16 @@ function adminIncentiveHtml(){
     const ledger = employeeIncentiveLedger(emp.id);
     const balance = incentiveBalance(ledger);
     const pending = incentivePendingWithdrawals(ledger);
+    const empAccounts = (state.adminAccounts||[]).filter(a=>a.employee_id===emp.id);
+    const empSettlements = (state.adminSettlements||[]).filter(s=>s.employee_id===emp.id);
+    const est = estimateCurrentSettlement(empAccounts, state.adminBalances||{}, state.adminCashflows||{}, emp.monthly_salary, empSettlements, 0.5);
     return `<tr>
       <td>${emp.name}</td>
       <td class="num" style="color:${balance<0?'var(--negative)':'inherit'}"><strong>${yen(balance)}</strong></td>
       <td class="num">${pending>0?yen(pending):'—'}</td>
+      <td class="num" style="color:${est&&est.employeeAmount<0?'var(--negative)':'var(--muted)'}">${est?yen(Math.round(est.employeeAmount)):'—'}</td>
     </tr>`;
-  }).join('') || `<tr><td colspan="3" class="empty">社員が登録されていません</td></tr>`;
+  }).join('') || `<tr><td colspan="4" class="empty">社員が登録されていません</td></tr>`;
 
   const pendingWithdrawals = (state.adminIncentiveLedger||[]).filter(e=>e.entry_type==='withdrawal' && e.status==='pending');
   const pendingRows = pendingWithdrawals.map(w => `<tr>
@@ -1406,7 +1501,7 @@ function adminIncentiveHtml(){
   <div class="card">
     <h2>インセンティブ残高</h2>
     <table>
-      <thead><tr><th>社員</th><th class="num">現在の残高</th><th class="num">引き出し申請中</th></tr></thead>
+      <thead><tr><th>社員</th><th class="num">現在の残高(確定分)</th><th class="num">引き出し申請中</th><th class="num">今期の見込み(未確定)</th></tr></thead>
       <tbody>${summaryRows}</tbody>
     </table>
   </div>
@@ -1426,12 +1521,39 @@ function adminIncentiveHtml(){
   </div>`;
 }
 
+/* 会社の期首月から、選択可能な年度リストを生成 */
+function fiscalYearOptions(fiscalStartMonth, count){
+  count = count || 6;
+  const options = [];
+  const now = new Date();
+  // 現在進行中の年度の期首年を求める
+  let startYear = now.getFullYear();
+  if(now.getMonth()+1 < fiscalStartMonth) startYear -= 1;
+  for(let i=0; i<count; i++){
+    const y = startYear - i;
+    const start = `${y}-${String(fiscalStartMonth).padStart(2,'0')}-01`;
+    const endMonth = fiscalStartMonth === 1 ? 12 : fiscalStartMonth - 1;
+    const endYear = fiscalStartMonth === 1 ? y : y + 1;
+    const end = monthEndDate(`${endYear}-${String(endMonth).padStart(2,'0')}`);
+    const isCurrent = i === 0;
+    options.push({ start, end, isCurrent,
+      label: `${y}年${fiscalStartMonth}月 〜 ${endYear}年${endMonth}月${isCurrent?'(進行中)':''}` });
+  }
+  return options;
+}
+
 function adminSettlementHtml(){
-  if(!state.settlementForm){
-    const now = new Date();
+  const company = state.companies.find(c=>c.id===state.adminCompanyId);
+  const fiscalStartMonth = company?.fiscal_year_start_month || 4;
+  const years = fiscalYearOptions(fiscalStartMonth);
+
+  if(!state.settlementForm || state.settlementForm.companyId !== state.adminCompanyId){
+    // 会社を切り替えたら、その会社の「直近の完了した年度」をデフォルト選択
+    const defaultYear = years.find(y=>!y.isCurrent) || years[0];
     state.settlementForm = {
-      start: `${now.getFullYear()-1}-01-01`,
-      end: `${now.getFullYear()}-01-01`,
+      companyId: state.adminCompanyId,
+      start: defaultYear.start,
+      end: defaultYear.end,
       taxActive: false,
       taxRate: 0.30,
       splitRate: 0.5,
@@ -1439,10 +1561,18 @@ function adminSettlementHtml(){
   }
   const f = state.settlementForm;
 
+  const yearOptions = years.map(y =>
+    `<option value="${y.start}|${y.end}" ${y.start===f.start?'selected':''}>${y.label}</option>`
+  ).join('');
+
   const remainingLoss = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
 
+  const selectedYear = years.find(y=>y.start===f.start);
+  const isCurrentYear = selectedYear?.isCurrent;
+
   const rows = (state.adminEmployees||[]).map(emp => {
-    const profit = employeeInvestmentProfit(emp.id, f.start, f.end);
+    // 期首残高 = 年度開始日の前日(=前年度末)時点の残高
+    const profit = employeeInvestmentProfit(emp.id, addDaysStr(f.start,-1), f.end);
     const annualSalary = Number(emp.monthly_salary) * 12;
     const taxCost = (f.taxActive && profit > 0) ? profit * f.taxRate : 0;
     const distributable = profit - annualSalary - taxCost;
@@ -1464,36 +1594,45 @@ function adminSettlementHtml(){
         <div class="stat"><div class="label">会社取り分</div><div class="value">${yen(companyShare)}</div></div>
       </div>
       <div style="margin-top:16px;">
-        <button class="btn-accent" ${already?'disabled':''} onclick="saveAnnualSettlement({
+        <button class="btn-accent" ${(already||isCurrentYear)?'disabled':''} onclick="saveAnnualSettlement({
           employeeId:'${emp.id}', start:'${f.start}', end:'${f.end}',
           investmentProfit:${profit}, salaryCost:${annualSalary},
           taxActive:${f.taxActive}, taxRate:${f.taxRate}, splitRate:${f.splitRate}
-        })">${already?'この期間は記録済みです':'この内容で確定してインセンティブに反映'}</button>
+        })">${already?'この年度は記録済みです':(isCurrentYear?'進行中の年度は確定できません':'この内容で確定してインセンティブに反映')}</button>
       </div>
     </div>`;
   }).join('') || `<div class="card"><p class="empty">社員が登録されていません</p></div>`;
 
   return `
   <div class="card">
-    <h2>年次精算の条件設定</h2>
-    <div class="desc">現在のこの会社の繰越欠損金残高合計: <strong>${yen(remainingLoss)}</strong>${remainingLoss<=0?' — 使い切っているため通常は法人税が発生します':' — 残っているため通常は法人税は発生しません'}</div>
+    <h2>年次精算</h2>
+    <div class="desc">この会社の決算期: 毎年${fiscalStartMonth}月開始。現在の繰越欠損金残高合計: <strong>${yen(remainingLoss)}</strong>${remainingLoss<=0?' — 使い切っているため通常は法人税が発生します':' — 残っているため通常は法人税は発生しません'}</div>
     <div class="row">
-      <div><label>対象期間・開始</label><input type="date" value="${f.start}" onchange="state.settlementForm.start=this.value; renderAdminTabContent();" /></div>
-      <div><label>対象期間・終了</label><input type="date" value="${f.end}" onchange="state.settlementForm.end=this.value; renderAdminTabContent();" /></div>
-    </div>
-    <div class="row" style="margin-top:10px;">
       <div>
-        <label>この期間、会社は法人税が発生する</label>
+        <label>対象年度</label>
+        <select onchange="const [s,e]=this.value.split('|'); state.settlementForm.start=s; state.settlementForm.end=e; renderAdminTabContent();">${yearOptions}</select>
+      </div>
+      <div>
+        <label>この年度、会社は法人税が発生する</label>
         <select onchange="state.settlementForm.taxActive=(this.value==='yes'); renderAdminTabContent();">
           <option value="no" ${!f.taxActive?'selected':''}>いいえ(繰越欠損金でまだ相殺できる)</option>
           <option value="yes" ${f.taxActive?'selected':''}>はい(繰越欠損金を使い切った)</option>
         </select>
       </div>
+    </div>
+    <div class="row" style="margin-top:10px;">
       <div><label>法人税率</label><input type="number" step="0.01" value="${f.taxRate}" onchange="state.settlementForm.taxRate=Number(this.value); renderAdminTabContent();" /></div>
       <div><label>分配比率(社員側)</label><input type="number" step="0.05" value="${f.splitRate}" onchange="state.settlementForm.splitRate=Number(this.value); renderAdminTabContent();" /></div>
     </div>
   </div>
   ${rows}`;
+}
+
+/* 日付文字列に日数を加算 */
+function addDaysStr(dateStr, days){
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0,10);
 }
 
 function adminPLHtml(){
