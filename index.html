@@ -161,8 +161,15 @@
 
   .empty{color:var(--muted);font-size:13px;padding:14px 0;}
   .muted{color:var(--muted);}
-  .company-picker{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;align-items:center;}
+  .company-picker{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
   .company-picker > button{padding:8px 14px;font-size:13px;background:#fff;border:1px solid var(--border);color:var(--ink);}
+  .company-bar{display:flex;gap:8px;margin-bottom:16px;align-items:center;}
+  .company-select{
+    flex:1;max-width:340px;
+    font-weight:600;font-size:14.5px;
+    padding:11px 12px;
+  }
+  .company-gear{padding:10px 13px;font-size:15px;line-height:1;}
   .company-chip{
     display:flex;align-items:center;gap:2px;
     background:#fff;border:1px solid var(--border);border-radius:8px;overflow:hidden;
@@ -181,6 +188,51 @@
   .row-delete:hover{color:var(--negative);}
 
   .loss-expiry-warn{color:var(--warn);font-weight:700;}
+
+  /* --- テーブルはカード内で横スクロール可能に --- */
+  .table-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+
+  /* --- モバイル最適化 (iPhone等) --- */
+  @media (max-width: 640px){
+    .container{padding:16px 12px 48px;}
+    .card{padding:16px 14px;margin-bottom:14px;border-radius:10px;}
+    .topbar{padding:12px 14px;}
+    .topbar .brand{font-size:14.5px;}
+    .topbar button{padding:7px 10px;font-size:11.5px;}
+
+    /* タブは折り返さず横スクロール */
+    .tabs{
+      flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;
+      margin-bottom:14px;padding-bottom:4px;
+      scrollbar-width:none;
+    }
+    .tabs::-webkit-scrollbar{display:none;}
+    .tabs button{white-space:nowrap;padding:8px 13px;font-size:13px;flex-shrink:0;}
+
+    .company-select{max-width:none;}
+
+    /* テーブルを小さく詰めて、カード内で横スクロール */
+    .card{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+    table{font-size:12px;min-width:100%;}
+    th,td{padding:7px 6px;white-space:nowrap;}
+
+    .stat .value{font-size:18px;}
+    .row{gap:10px;}
+    .row > *{min-width:140px;}
+
+    .form-inline{gap:8px;}
+    .form-inline > div{min-width:100%;}
+    .form-inline button{width:100%;}
+
+    button{padding:10px 14px;}
+    .btn-approve,.btn-reject{padding:6px 10px;font-size:12px;}
+    .row-delete{font-size:11.5px;padding:3px 6px;}
+
+    .gate-card{padding:28px 20px;}
+    .wave{margin:18px 0;}
+
+    canvas{max-height:220px;}
+  }
 </style>
 </head>
 <body>
@@ -1114,14 +1166,27 @@ function renderEmployeeDashboard(){
    レンダリング: 管理者ダッシュボード
 ===================================================================== */
 function renderAdminDashboard(){
-  const companyPicker = state.companies.map((c,i) => `
-    <div class="company-chip ${c.id===state.adminCompanyId?'active':''}">
-      <button class="chip-arrow" ${i===0?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',-1)" title="左に移動">◀</button>
-      <span class="chip-label" onclick="switchAdminCompany('${c.id}')">${c.name}</span>
-      <button class="chip-arrow" ${i===state.companies.length-1?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',1)" title="右に移動">▶</button>
-      <button class="chip-delete" onclick="deleteCompany('${c.id}','${c.name}')" title="この会社を削除">✕</button>
-    </div>`
-  ).join('');
+  const companySelect = `
+    <div class="company-bar">
+      <select class="company-select" onchange="switchAdminCompany(this.value)">
+        ${state.companies.map(c=>`<option value="${c.id}" ${c.id===state.adminCompanyId?'selected':''}>${c.name}</option>`).join('')}
+      </select>
+      <button class="btn-ghost company-gear" onclick="state.showCompanyManager=!state.showCompanyManager; renderAdminDashboard();" title="会社の追加・並び替え・削除">⚙</button>
+    </div>
+    ${state.showCompanyManager ? `
+    <div class="card" style="padding:14px 16px;">
+      <div class="desc" style="margin-bottom:10px;">会社の並び替え(◀▶)・削除(✕)・追加ができます。</div>
+      <div class="company-picker">
+        ${state.companies.map((c,i) => `
+        <div class="company-chip ${c.id===state.adminCompanyId?'active':''}">
+          <button class="chip-arrow" ${i===0?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',-1)" title="左に移動">◀</button>
+          <span class="chip-label" onclick="switchAdminCompany('${c.id}')">${c.name}</span>
+          <button class="chip-arrow" ${i===state.companies.length-1?'disabled style="opacity:.25"':''} onclick="moveCompany('${c.id}',1)" title="右に移動">▶</button>
+          <button class="chip-delete" onclick="deleteCompany('${c.id}','${c.name}')" title="この会社を削除">✕</button>
+        </div>`).join('')}
+        <button onclick="promptAddCompany()">＋ 会社を追加</button>
+      </div>
+    </div>` : ''}`;
 
   const tabs = [
     ['accounts','口座残高・入出金'],
@@ -1138,15 +1203,12 @@ function renderAdminDashboard(){
     <div class="topbar">
       <div><div class="brand">会社管理</div><div class="who">管理者モード</div></div>
       <div style="display:flex;gap:8px;">
-        <button onclick="downloadBackup()">バックアップをダウンロード</button>
+        <button onclick="downloadBackup()">バックアップ</button>
         <button onclick="logout()">ログアウト</button>
       </div>
     </div>
     <div class="container">
-      <div class="company-picker">
-        ${companyPicker}
-        <button onclick="promptAddCompany()">＋ 会社を追加</button>
-      </div>
+      ${companySelect}
       <div class="tabs">${tabs}</div>
       <div id="admin-tab-content"></div>
     </div>
