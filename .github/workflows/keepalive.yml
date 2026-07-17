@@ -1,0 +1,26 @@
+name: Supabase Keepalive
+
+# Supabase無料プランの「1週間非アクティブで一時停止」を防ぐため、
+# 週2回(月曜・木曜の朝9時JST)にデータベースへ軽いアクセスを送ります。
+on:
+  schedule:
+    - cron: '0 0 * * 1,4'   # UTC 0:00 = 日本時間 9:00 (月・木)
+  workflow_dispatch:          # 手動実行も可能
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://pqaiobvekbybvsfmtobo.supabase.co/rest/v1/company_directory?select=id&limit=1" \
+            -H "apikey: sb_publishable_wPiV5f3aTMX9u3OSBoiwvQ_93wYoUb7" \
+            -H "Authorization: Bearer sb_publishable_wPiV5f3aTMX9u3OSBoiwvQ_93wYoUb7")
+          echo "HTTP status: $STATUS"
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 300 ]; then
+            echo "Supabase is alive."
+          else
+            echo "Ping failed with status $STATUS"
+            exit 1
+          fi
