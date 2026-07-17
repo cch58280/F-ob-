@@ -432,8 +432,16 @@ async function loadEmployeeData(){
     state.myCashflows[acc.id] = cfs || [];
   }
 
-  const { data: expenses } = await sb.from('expenses').select('*').eq('employee_id', employeeId).order('created_at', {ascending:false});
-  state.myExpenses = expenses || [];
+  const { data: annualExp } = await sb.from('annual_expenses').select('*').eq('employee_id', employeeId).order('fiscal_year_end', {ascending:false});
+  state.myAnnualExpenses = annualExp || [];
+
+  // 自分の会社の決算期(チャートの年次集計用)
+  if(state.currentEmployee?.company_id){
+    const { data: myCompany } = await sb.from('companies').select('*').eq('id', state.currentEmployee.company_id).maybeSingle();
+    state.myCompanyFiscalMonth = myCompany?.fiscal_year_start_month || 4;
+  } else {
+    state.myCompanyFiscalMonth = 4;
+  }
 
   const { data: ledger } = await sb.from('incentive_ledger').select('*').eq('employee_id', employeeId).order('created_at', {ascending:false});
   state.myIncentiveLedger = ledger || [];
@@ -509,7 +517,7 @@ function estimateCurrentSettlement(accounts, balancesByAccount, cashflowsByAccou
   const salaryCost = Number(monthlySalary||0) * months;
 
   const distributable = profit - salaryCost;
-  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;
+  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;  // マイナスは全額社員負担
 
   return { startDate, months, profit, salaryCost, distributable, employeeAmount };
 }
@@ -553,17 +561,6 @@ async function deleteBalanceEmployee(id){
   if(!confirm('この残高記録を削除します。よろしいですか？')) return;
   const { error } = await sb.from('monthly_balances').delete().eq('id', id);
   if(error){ alert('削除に失敗しました: '+error.message); return; }
-  loadEmployeeData();
-}
-
-async function addExpense(date, amount, description){
-  const { error } = await sb.from('expenses').insert({
-    employee_id: state.session.employeeId,
-    expense_date: date,
-    amount: amount,
-    description: description
-  });
-  if(error){ alert('申請に失敗しました: ' + error.message); return; }
   loadEmployeeData();
 }
 
@@ -640,12 +637,12 @@ async function loadAdminData(){
   }
 
   const empIds = (employees||[]).map(e=>e.id);
-  let expenses = [];
+  let annualExpenses = [];
   if(empIds.length){
-    const { data } = await sb.from('expenses').select('*').in('employee_id', empIds).order('created_at', {ascending:false});
-    expenses = data || [];
+    const { data } = await sb.from('annual_expenses').select('*').in('employee_id', empIds).order('fiscal_year_end', {ascending:false});
+    annualExpenses = data || [];
   }
-  state.adminExpenses = expenses;
+  state.adminAnnualExpenses = annualExpenses;
 
   const { data: pl } = await sb.from('company_pl_summary').select('*').eq('company_id', companyId).order('fiscal_year_end', {ascending:false});
   state.adminPL = pl || [];
@@ -690,42 +687,6 @@ function switchAdminTab(tab){
   renderAdminDashboard();
 }
 
-async function approveExpense(id, paidFrom){
-  const expense = (state.adminExpenses||[]).find(e=>e.id===id);
-  if(!expense) return;
-
-  if(paidFrom === 'incentive'){
-    const available = incentiveAvailable(employeeIncentiveLedger(expense.employee_id));
-    if(Number(expense.amount) > available){
-      alert(`インセンティブ残高(引き出し申請中を除く利用可能額: ${yen(available)})が経費金額に足りません`);
-      return;
-    }
-  }
-
-  const { data:{ user } } = await sb.auth.getUser();
-  const { error } = await sb.from('expenses').update({
-    status:'approved', paid_from: paidFrom, approved_by:user.id, approved_at:new Date().toISOString()
-  }).eq('id', id);
-  if(error){ alert('更新に失敗しました: '+error.message); return; }
-
-  if(paidFrom === 'incentive'){
-    await sb.from('incentive_ledger').insert({
-      employee_id: expense.employee_id,
-      entry_type: 'expense_payment',
-      amount: -Math.abs(Number(expense.amount)),
-      status: 'completed',
-      related_expense_id: id,
-      note: expense.description || null
-    });
-  }
-  loadAdminData();
-}
-async function rejectExpense(id){
-  const { data:{ user } } = await sb.auth.getUser();
-  const { error } = await sb.from('expenses').update({ status:'rejected', approved_by:user.id, approved_at:new Date().toISOString() }).eq('id', id);
-  if(error){ alert('更新に失敗しました: '+error.message); return; }
-  loadAdminData();
-}
 
 async function addEmployee(name, salary){
   const { error } = await sb.from('employees').insert({ company_id: state.adminCompanyId, name, monthly_salary: salary });
@@ -825,13 +786,6 @@ async function deleteCashflow(id){
   loadAdminData();
 }
 
-async function deleteExpenseRecord(id){
-  if(!confirm('この経費申請を削除します。よろしいですか？')) return;
-  const { error } = await sb.from('expenses').delete().eq('id', id);
-  if(error){ alert('削除に失敗しました: '+error.message); return; }
-  loadAdminData();
-}
-
 async function deleteLoss(id){
   if(!confirm('この繰越欠損金の記録を削除します。よろしいですか？')) return;
   const { error } = await sb.from('loss_carryforward_vintages').delete().eq('id', id);
@@ -920,9 +874,11 @@ function employeeInvestmentProfit(employeeId, startDate, endDate){
 /* ---------------------------------------------------------------------
    口座管理タブ用: 残高記録の間隔ごとに「その間の入出金」「投資収益」を算出
 --------------------------------------------------------------------- */
-function monthlySeriesForAccount(accountId){
-  const balances = (state.adminBalances[accountId]||[]).slice().sort((a,b)=>a.year_month.localeCompare(b.year_month));
-  const cashflows = (state.adminCashflows[accountId]||[]).slice().sort((a,b)=>a.flow_date.localeCompare(b.flow_date));
+function monthlySeriesForAccount(accountId, balancesMap, cashflowsMap){
+  balancesMap = balancesMap || state.adminBalances || {};
+  cashflowsMap = cashflowsMap || state.adminCashflows || {};
+  const balances = (balancesMap[accountId]||[]).slice().sort((a,b)=>a.year_month.localeCompare(b.year_month));
+  const cashflows = (cashflowsMap[accountId]||[]).slice().sort((a,b)=>a.flow_date.localeCompare(b.flow_date));
   const series = [];
   let prevBalance = null;
   let prevBoundary = null;
@@ -952,7 +908,7 @@ async function saveAnnualSettlement(fields){
   const taxCost = (taxActive && investmentProfit > 0) ? investmentProfit * taxRate : 0;
   const distributable = investmentProfit - salaryCost - taxCost;
   const splitRate = fields.splitRate;
-  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;
+  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;  // マイナスは全額社員負担
   const companyShare = distributable >= 0 ? (distributable - employeeAmount) : 0;
 
   const { data: settlement, error } = await sb.from('annual_settlements').upsert({
@@ -1072,7 +1028,12 @@ function renderPinScreen(kind){
 function renderEmployeeDashboard(){
   const empName = state.currentEmployee?.name || '';
   const accounts = state.myAccounts || [];
-  const expenses = state.myExpenses || [];
+
+  // 口座チャート用の選択状態
+  if(accounts.length && (!state.mySelectedChartAccountId || !accounts.find(a=>a.id===state.mySelectedChartAccountId))){
+    state.mySelectedChartAccountId = accounts[0].id;
+  }
+  if(!state.myChartPeriod) state.myChartPeriod = 'monthly';
 
   const accountsHtml = accounts.map(acc => {
     const balances = state.myBalances[acc.id] || [];
@@ -1101,13 +1062,26 @@ function renderEmployeeDashboard(){
     </div>`;
   }).join('') || `<div class="card"><p class="empty">担当口座がまだ登録されていません。管理者に依頼してください。</p></div>`;
 
-  const expenseRows = expenses.map(e => {
-    const paidFromLabel = { company:'会社', incentive:'インセンティブ' };
-    const badge = e.status==='approved' ? `<span class="badge badge-approved">承認済み(${paidFromLabel[e.paid_from]||'会社'}負担)</span>`
-      : e.status==='rejected' ? '<span class="badge badge-rejected">却下</span>'
-      : '<span class="badge badge-pending">申請中</span>';
-    return `<tr><td>${e.expense_date}</td><td>${e.description||''}</td><td class="num">${yen(e.amount)}</td><td>${badge}</td></tr>`;
-  }).join('') || `<tr><td colspan="4" class="empty">経費申請はまだありません</td></tr>`;
+  // チャートセクション(口座がある場合のみ)
+  const accOptions = accounts.map(a=>`<option value="${a.id}" ${a.id===state.mySelectedChartAccountId?'selected':''}>${a.account_name}</option>`).join('');
+  const periodLabel = state.myChartPeriod==='yearly' ? '年次' : '月次';
+  const chartsHtml = accounts.length ? `
+      ${waveDivider()}
+      <div class="chart-toolbar">
+        <select class="chart-account-select" onchange="state.mySelectedChartAccountId=this.value; renderEmployeeDashboard();">${accOptions}</select>
+        <div class="period-toggle">
+          <button class="${state.myChartPeriod==='monthly'?'active':''}" onclick="state.myChartPeriod='monthly'; renderEmployeeDashboard();">月次</button>
+          <button class="${state.myChartPeriod==='yearly'?'active':''}" onclick="state.myChartPeriod='yearly'; renderEmployeeDashboard();">年次</button>
+        </div>
+      </div>
+      <div class="card chart-card">
+        <h3>残高推移<span class="chart-sub">(棒 = ${periodLabel}の入出金)</span></h3>
+        <div class="chart-box"><canvas id="emp-balance-chart"></canvas></div>
+      </div>
+      <div class="card chart-card">
+        <h3>${periodLabel}投資収益<span class="chart-sub">(入出金調整後)</span></h3>
+        <div class="chart-box"><canvas id="emp-profit-chart"></canvas></div>
+      </div>` : '';
 
   const ledger = state.myIncentiveLedger || [];
   const balance = incentiveBalance(ledger);
@@ -1134,6 +1108,21 @@ function renderEmployeeDashboard(){
     <td>${statusLabel[e.status]||e.status}</td>
   </tr>`).join('') || `<tr><td colspan="4" class="empty">まだ履歴はありません</td></tr>`;
 
+  // 年次経費(小スペース表示)
+  const annualExp = state.myAnnualExpenses || [];
+  const expRows = annualExp.map(e => `<tr>
+    <td>〜${e.fiscal_year_end}</td>
+    <td class="num">${yen(e.amount)}</td>
+  </tr>`).join('') || `<tr><td colspan="2" class="empty">記録はまだありません</td></tr>`;
+  const annualExpHtml = `
+      <div class="card" style="padding:16px 18px;">
+        <h3 style="font-size:14px;margin-bottom:8px;">年度別 経費利用額</h3>
+        <table style="font-size:12.5px;">
+          <thead><tr><th>年度</th><th class="num">合計</th></tr></thead>
+          <tbody>${expRows}</tbody>
+        </table>
+      </div>`;
+
   app.innerHTML = `
     <div class="topbar">
       <div><div class="brand">会社管理</div><div class="who">${empName} さん</div></div>
@@ -1141,6 +1130,7 @@ function renderEmployeeDashboard(){
     </div>
     <div class="container">
       ${accountsHtml}
+      ${chartsHtml}
       ${waveDivider()}
       <div class="card">
         <h2>インセンティブ</h2>
@@ -1161,23 +1151,22 @@ function renderEmployeeDashboard(){
           <button class="btn-accent" onclick="requestWithdrawal(Number(document.getElementById('wd-amount').value), document.getElementById('wd-note').value)">引き出し申請</button>
         </div>
       </div>
-      ${waveDivider()}
-      <div class="card">
-        <h2>経費申請</h2>
-        <div class="desc">承認は経理担当者が行います。会社負担/インセンティブ充当のどちらで承認されたかは下の一覧に表示されます。</div>
-        <table>
-          <thead><tr><th>日付</th><th>内容</th><th class="num">金額</th><th>状態</th></tr></thead>
-          <tbody>${expenseRows}</tbody>
-        </table>
-        <div class="form-inline">
-          <div><label>日付</label><input type="date" id="exp-date" /></div>
-          <div><label>内容</label><input type="text" id="exp-desc" placeholder="例: 交通費" /></div>
-          <div><label>金額</label><input type="number" id="exp-amount" placeholder="例: 3200" /></div>
-          <button class="btn-accent" onclick="addExpense(document.getElementById('exp-date').value, Number(document.getElementById('exp-amount').value), document.getElementById('exp-desc').value)">申請する</button>
-        </div>
-      </div>
+      ${annualExpHtml}
     </div>
   `;
+
+  if(accounts.length){
+    drawAccountCharts({
+      keyPrefix: 'emp',
+      accountId: state.mySelectedChartAccountId,
+      balancesMap: state.myBalances,
+      cashflowsMap: state.myCashflows,
+      fsm: state.myCompanyFiscalMonth || 4,
+      period: state.myChartPeriod,
+      balanceCanvasId: 'emp-balance-chart',
+      profitCanvasId: 'emp-profit-chart',
+    });
+  }
 }
 
 /* =====================================================================
@@ -1210,7 +1199,7 @@ function renderAdminDashboard(){
     ['accounts','口座残高・入出金'],
     ['chart','口座管理'],
     ['cost','社員コスト'],
-    ['expenses','経費承認'],
+    ['expenses','経費(年次)'],
     ['incentive','インセンティブ'],
     ['settlement','年次精算'],
     ['pl','簡易PL'],
@@ -1356,10 +1345,10 @@ function adminCashflowSectionHtml(){
 }
 
 /* 年次集計: monthlySeriesを会社の期首月で年度グルーピング */
-function yearlySeriesForAccount(accountId){
+function yearlySeriesForAccount(accountId, balancesMap, cashflowsMap, fsmOverride){
   const company = state.companies.find(c=>c.id===state.adminCompanyId);
-  const fsm = company?.fiscal_year_start_month || 4;
-  const monthly = monthlySeriesForAccount(accountId);
+  const fsm = fsmOverride || company?.fiscal_year_start_month || 4;
+  const monthly = monthlySeriesForAccount(accountId, balancesMap, cashflowsMap);
   const groups = {};
   monthly.forEach(s => {
     const y = Number(s.year_month.slice(0,4));
@@ -1383,12 +1372,17 @@ function yearlySeriesForAccount(accountId){
   });
 }
 
-function chartSeries(){
-  const period = state.chartPeriod || 'monthly';
+function chartSeries(ctx){
+  // ctx未指定 = 管理者画面 / ctx指定 = 社員画面
+  const accountId = ctx ? ctx.accountId : state.selectedChartAccountId;
+  const balancesMap = ctx ? ctx.balancesMap : undefined;
+  const cashflowsMap = ctx ? ctx.cashflowsMap : undefined;
+  const fsm = ctx ? ctx.fsm : undefined;
+  const period = (ctx ? ctx.period : state.chartPeriod) || 'monthly';
   if(period === 'yearly'){
-    return yearlySeriesForAccount(state.selectedChartAccountId).map(s=>({ ...s }));
+    return yearlySeriesForAccount(accountId, balancesMap, cashflowsMap, fsm).map(s=>({ ...s }));
   }
-  return monthlySeriesForAccount(state.selectedChartAccountId).map(s=>({ ...s, label: ym(s.year_month) }));
+  return monthlySeriesForAccount(accountId, balancesMap, cashflowsMap).map(s=>({ ...s, label: ym(s.year_month) }));
 }
 
 function adminChartHtml(){
@@ -1448,15 +1442,19 @@ function yenShort(v){
   return n.toLocaleString('ja-JP');
 }
 
-function drawAccountCharts(){
+function drawAccountCharts(ctx){
   if(!window.Chart) return;
-  const series = chartSeries();
+  const series = chartSeries(ctx);
   const labels = series.map(s=>s.label);
   const isMobile = window.innerWidth <= 640;
+  const prefix = (ctx && ctx.keyPrefix) || 'admin';
+  const balanceCanvasId = (ctx && ctx.balanceCanvasId) || 'balance-chart';
+  const profitCanvasId = (ctx && ctx.profitCanvasId) || 'profit-chart';
 
   state.charts = state.charts || {};
-  if(state.charts.balance){ state.charts.balance.destroy(); state.charts.balance = null; }
-  if(state.charts.profit){ state.charts.profit.destroy(); state.charts.profit = null; }
+  const bKey = prefix + '-balance', pKey = prefix + '-profit';
+  if(state.charts[bKey]){ state.charts[bKey].destroy(); state.charts[bKey] = null; }
+  if(state.charts[pKey]){ state.charts[pKey].destroy(); state.charts[pKey] = null; }
 
   const commonTicks = {
     font: { size: isMobile ? 10 : 12 },
@@ -1468,9 +1466,9 @@ function drawAccountCharts(){
     maxRotation: isMobile ? 45 : 0,
   };
 
-  const balanceCanvas = document.getElementById('balance-chart');
+  const balanceCanvas = document.getElementById(balanceCanvasId);
   if(balanceCanvas){
-    state.charts.balance = new Chart(balanceCanvas, {
+    state.charts[bKey] = new Chart(balanceCanvas, {
       data: {
         labels,
         datasets: [
@@ -1504,9 +1502,9 @@ function drawAccountCharts(){
     });
   }
 
-  const profitCanvas = document.getElementById('profit-chart');
+  const profitCanvas = document.getElementById(profitCanvasId);
   if(profitCanvas){
-    state.charts.profit = new Chart(profitCanvas, {
+    state.charts[pKey] = new Chart(profitCanvas, {
       type:'bar',
       data: {
         labels,
@@ -1534,7 +1532,7 @@ function drawAccountCharts(){
 
 function adminCostHtml(){
   const approvedByEmployee = {};
-  (state.adminExpenses||[]).filter(e=>e.status==='approved' && e.paid_from==='company').forEach(e=>{
+  (state.adminAnnualExpenses||[]).filter(e=>e.funded_by==='company').forEach(e=>{
     approvedByEmployee[e.employee_id] = (approvedByEmployee[e.employee_id]||0) + Number(e.amount);
   });
   const rows = (state.adminEmployees||[]).map(emp => {
@@ -1552,10 +1550,10 @@ function adminCostHtml(){
 
   return `
   <div class="card">
-    <h2>社員コスト(月給 + 会社負担の承認済み経費)</h2>
-    <div class="desc">インセンティブから支払われた経費は会社コストに含めていません(社員本人の取り分から充当されているため)。</div>
+    <h2>社員コスト(月給 + 会社負担の年度経費)</h2>
+    <div class="desc">「経費(年次)」タブで会社負担として登録した経費のみ集計しています(インセンティブから控除した分は含みません)。</div>
     <table>
-      <thead><tr><th>社員</th><th class="num">月給</th><th class="num">会社負担の経費(累計)</th><th class="num">コスト計</th><th class="num">インセンティブ残高</th></tr></thead>
+      <thead><tr><th>社員</th><th class="num">月給</th><th class="num">会社負担経費(累計)</th><th class="num">コスト計</th><th class="num">インセンティブ残高</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </div>`;
@@ -1563,44 +1561,91 @@ function adminCostHtml(){
 
 function adminExpensesHtml(){
   const employeesById = Object.fromEntries((state.adminEmployees||[]).map(e=>[e.id,e.name]));
-  const paidFromLabel = { company:'会社', incentive:'インセンティブ' };
-  const rows = (state.adminExpenses||[]).map(e => {
-    let badge, actions;
-    if(e.status==='approved'){
-      badge = `<span class="badge badge-approved">承認済み(${paidFromLabel[e.paid_from]||'会社'}負担)</span>`;
-      actions = '';
-    } else if(e.status==='rejected'){
-      badge = '<span class="badge badge-rejected">却下</span>';
-      actions = `<button class="row-delete" onclick="deleteExpenseRecord('${e.id}')">削除</button>`;
-    } else {
-      badge = '<span class="badge badge-pending">申請中</span>';
-      const available = incentiveAvailable(employeeIncentiveLedger(e.employee_id));
-      const canUseIncentive = available >= Number(e.amount);
-      actions = `
-        <button class="btn-approve" onclick="approveExpense('${e.id}','company')">承認(会社)</button>
-        <button class="btn-approve" style="background:var(--accent)" ${canUseIncentive?'':'disabled title="インセンティブ残高不足"'} onclick="approveExpense('${e.id}','incentive')">承認(インセンティブ)</button>
-        <button class="btn-reject" onclick="rejectExpense('${e.id}')">却下</button>
-        <button class="row-delete" onclick="deleteExpenseRecord('${e.id}')">削除</button>`;
-    }
-    return `<tr>
-      <td>${employeesById[e.employee_id]||'—'}</td>
-      <td>${e.expense_date}</td>
-      <td>${e.description||''}</td>
-      <td class="num">${yen(e.amount)}</td>
-      <td>${badge}</td>
-      <td>${actions}</td>
-    </tr>`;
-  }).join('') || `<tr><td colspan="6" class="empty">経費申請はまだありません</td></tr>`;
+  const fundedLabel = { company:'会社負担', incentive:'インセンティブから控除' };
+  const rows = (state.adminAnnualExpenses||[]).map(e => `<tr>
+    <td>${employeesById[e.employee_id]||'—'}</td>
+    <td>〜${e.fiscal_year_end}</td>
+    <td class="num">${yen(e.amount)}</td>
+    <td>${fundedLabel[e.funded_by]||e.funded_by}</td>
+    <td class="muted">${e.note||''}</td>
+    <td><button class="row-delete" onclick="deleteAnnualExpense('${e.id}')">削除</button></td>
+  </tr>`).join('') || `<tr><td colspan="6" class="empty">記録はまだありません</td></tr>`;
+
+  const empOptions = (state.adminEmployees||[]).map(e=>`<option value="${e.id}">${e.name}</option>`).join('');
+
+  const company = state.companies.find(c=>c.id===state.adminCompanyId);
+  const years = fiscalYearOptions(company?.fiscal_year_start_month || 4, 8);
+  const yearOptions = years.map(y=>`<option value="${y.end}">${y.label}</option>`).join('');
 
   return `
   <div class="card">
-    <h2>経費承認</h2>
-    <div class="desc">「承認(インセンティブ)」を選ぶと、会社の負担にはならず、その社員本人のインセンティブ残高から差し引かれます。</div>
+    <h2>経費(年度合計)</h2>
+    <div class="desc">社員ごとに年度の経費合計額を登録します。「インセンティブから控除」を選ぶと、その社員のインセンティブ残高から自動的に差し引かれます(会社負担を選ぶと社員コストタブに集計されます)。</div>
     <table>
-      <thead><tr><th>社員</th><th>日付</th><th>内容</th><th class="num">金額</th><th>状態</th><th></th></tr></thead>
+      <thead><tr><th>社員</th><th>年度</th><th class="num">合計額</th><th>負担</th><th>メモ</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
+    <div class="form-inline">
+      <div><label>社員</label><select id="ae-emp">${empOptions}</select></div>
+      <div><label>年度</label><select id="ae-year">${yearOptions}</select></div>
+      <div><label>合計額</label><input type="number" id="ae-amount" placeholder="例: 500000" /></div>
+      <div><label>負担</label>
+        <select id="ae-funded">
+          <option value="incentive">インセンティブから控除</option>
+          <option value="company">会社負担</option>
+        </select>
+      </div>
+      <div><label>メモ(任意)</label><input type="text" id="ae-note" /></div>
+      <button class="btn-accent" onclick="addAnnualExpense()">登録</button>
+    </div>
   </div>`;
+}
+
+async function addAnnualExpense(){
+  const employeeId = document.getElementById('ae-emp').value;
+  const fiscalYearEnd = document.getElementById('ae-year').value;
+  const amount = Number(document.getElementById('ae-amount').value);
+  const fundedBy = document.getElementById('ae-funded').value;
+  const note = document.getElementById('ae-note').value || null;
+  if(!employeeId || !fiscalYearEnd || !amount){ alert('社員・年度・金額を入力してください'); return; }
+
+  if(fundedBy === 'incentive'){
+    const available = incentiveAvailable(employeeIncentiveLedger(employeeId));
+    if(amount > available && !confirm(`インセンティブ残高(利用可能: ${yen(available)})を超えていますが、登録しますか？(残高がマイナスになります)`)) return;
+  }
+
+  const { data:{ user } } = await sb.auth.getUser();
+
+  let ledgerEntryId = null;
+  if(fundedBy === 'incentive'){
+    const { data: le, error: lerr } = await sb.from('incentive_ledger').insert({
+      employee_id: employeeId, entry_type: 'expense_payment',
+      amount: -Math.abs(amount), status: 'completed',
+      note: `〜${fiscalYearEnd} 年度経費合計` + (note ? `: ${note}` : ''),
+      created_by: user.id
+    }).select().single();
+    if(lerr){ alert('インセンティブ控除の記録に失敗しました: '+lerr.message); return; }
+    ledgerEntryId = le.id;
+  }
+
+  const { error } = await sb.from('annual_expenses').insert({
+    employee_id: employeeId, fiscal_year_end: fiscalYearEnd,
+    amount, funded_by: fundedBy, ledger_entry_id: ledgerEntryId, note, created_by: user.id
+  });
+  if(error){ alert('登録に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+async function deleteAnnualExpense(id){
+  const rec = (state.adminAnnualExpenses||[]).find(e=>e.id===id);
+  if(!rec) return;
+  if(!confirm('この年度経費の記録を削除します。インセンティブから控除されていた場合、その控除も取り消されます。よろしいですか？')) return;
+  if(rec.ledger_entry_id){
+    await sb.from('incentive_ledger').delete().eq('id', rec.ledger_entry_id);
+  }
+  const { error } = await sb.from('annual_expenses').delete().eq('id', id);
+  if(error){ alert('削除に失敗しました: '+error.message); return; }
+  loadAdminData();
 }
 
 function adminIncentiveHtml(){
@@ -1725,8 +1770,8 @@ function adminSettlementHtml(){
     const annualSalary = Number(emp.monthly_salary) * 12;
     const taxCost = (f.taxActive && profit > 0) ? profit * f.taxRate : 0;
     const distributable = profit - annualSalary - taxCost;
-    const employeeAmount = distributable >= 0 ? distributable * f.splitRate : distributable;
-    const companyShare = distributable >= 0 ? distributable - employeeAmount : 0;
+    const employeeAmount = distributable >= 0 ? distributable * f.splitRate : distributable;  // マイナスは全額社員負担
+    const companyShare = distributable >= 0 ? (distributable - employeeAmount) : 0;
     const already = (state.adminSettlements||[]).find(s=>s.employee_id===emp.id && s.fiscal_year_end===f.end);
 
     return `
