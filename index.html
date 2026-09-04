@@ -672,6 +672,9 @@ async function loadAdminData(){
   const { data: lossUsages } = await sb.from('loss_carryforward_usages').select('*').eq('company_id', companyId).order('fiscal_year_end', {ascending:false});
   state.adminLossUsages = lossUsages || [];
 
+  const { data: brackets } = await sb.from('corporate_tax_brackets').select('*').eq('company_id', companyId).order('sort_order');
+  state.adminTaxBrackets = brackets || [];
+
   state.adminCashflows = {};
   for(const acc of state.adminAccounts){
     const { data: cfs } = await sb.from('account_cashflows').select('*').eq('account_id', acc.id).order('flow_date', {ascending:false});
@@ -840,6 +843,7 @@ async function addPL(fields){
     fiscal_year_start: fields.start, fiscal_year_end: fields.end,
     revenue: fields.revenue, sga_cost: fields.sga, operating_profit: fields.op,
     pretax_profit: fields.pretax, tax_amount: fields.tax, net_profit: fields.net,
+    taxable_income_before_loss: fields.taxable,
     assumed_tax_rate: fields.rate, notes: fields.notes
   }, { onConflict:'company_id,fiscal_year_end' });
   if(error){ alert('登録に失敗しました: '+error.message); return; }
@@ -986,6 +990,60 @@ function activeMonthsInPeriod(emp, periodStart, periodEnd){
   return Math.max(0, to - from + 1);
 }
 
+/* ---------------------------------------------------------------------
+   法人税の計算（所得区分ごとの段階税率）
+   ---------------------------------------------------------------------
+   corporate_tax_brackets に「upper_limit までを rate で課税」という行を
+   並べておき、課税所得を区分ごとに切って積み上げる（累進計算）。
+   中小法人の初期値: 400万円以下 21.37% / 800万円以下 23.17% / 超 33.58%
+
+   税率テーブルが未登録の場合は fallbackRate（従来の一律税率）で計算するため、
+   マイグレーション前でも画面は壊れない。
+--------------------------------------------------------------------- */
+function computeCorporateTax(taxableIncome, brackets, fallbackRate){
+  const income = Math.max(0, Number(taxableIncome) || 0);
+  const rows = (brackets || []).slice().sort((a,b) => (a.sort_order||0) - (b.sort_order||0));
+
+  // 税率テーブルが無ければ従来どおり一律税率
+  if(!rows.length){
+    const rate = Number(fallbackRate) || 0;
+    return {
+      total: Math.round(income * rate),
+      breakdown: income > 0 ? [{ from: 0, to: Infinity, rate, part: income, amount: income * rate }] : [],
+      nextThreshold: null, nextRate: null, configured: false,
+    };
+  }
+
+  const breakdown = [];
+  let lower = 0, total = 0;
+  for(const b of rows){
+    const upper = (b.upper_limit === null || b.upper_limit === undefined) ? Infinity : Number(b.upper_limit);
+    if(income > lower){
+      const part = Math.min(income, upper) - lower;
+      if(part > 0){
+        const rate = Number(b.rate) || 0;
+        breakdown.push({ from: lower, to: upper, rate, part, amount: part * rate });
+        total += part * rate;
+      }
+    }
+    lower = upper;
+    if(!isFinite(upper)) break;
+  }
+
+  // 次に税率が変わる金額（いくら増えると区分が上がるか）
+  let nextThreshold = null, nextRate = null;
+  for(let i = 0; i < rows.length; i++){
+    const upper = (rows[i].upper_limit === null || rows[i].upper_limit === undefined) ? Infinity : Number(rows[i].upper_limit);
+    if(isFinite(upper) && income < upper){
+      nextThreshold = upper;
+      nextRate = rows[i+1] ? Number(rows[i+1].rate) : null;
+      break;
+    }
+  }
+
+  return { total: Math.round(total), breakdown, nextThreshold, nextRate, configured: true };
+}
+
 function annualExpenseTotalFor(employeeId, fiscalYearEnd, fundedBy){
   return (state.adminAnnualExpenses||[])
     .filter(e => e.employee_id === employeeId && e.fiscal_year_end === fiscalYearEnd
@@ -1010,11 +1068,41 @@ function computeYearSettlement(f){
   });
 
   const companyTaxBase = rows.reduce((s,r) => s + r.taxBase, 0);
+  const isFinal = (f.taxSource === 'final');
+
+  /* ------------------------------------------------------------------
+     決算確定値モード
+     ------------------------------------------------------------------
+     このアプリはトレード部分しか把握していないため、不動産賃料などが
+     あると正しい課税所得も税率区分も分からない。決算が終わったら
+     決算書の実額から「トレード分の税額」を按分で切り出す。
+
+       トレード分の税額 = 法人税等(実額) × (トレードの課税ベース ÷ 会社全体の所得)
+
+     分母は繰越欠損金を控除する前の所得金額。トレードの課税ベースも控除前の
+     数字なので基準がそろう。繰越欠損金はこのモードでは自動消し込みしない
+     （別表七の残高を「繰越欠損金」タブで直接更新する運用）。
+  ------------------------------------------------------------------ */
+  const pl = (state.adminPL || []).find(p => p.fiscal_year_end === f.end) || null;
+  const companyIncome    = pl ? Number(pl.taxable_income_before_loss) : null;
+  const companyTaxActual = pl ? Number(pl.tax_amount) : null;
+  const finalReady = isFinal
+    && companyIncome !== null && !isNaN(companyIncome)
+    && companyTaxActual !== null && !isNaN(companyTaxActual);
+  const tradeRatio = (finalReady && companyIncome > 0)
+    ? Math.min(1, Math.max(0, companyTaxBase / companyIncome)) : 0;
+
   const lossAvailable  = Math.max(0, Number(f.lossAvailable)||0);
-  const lossUsed       = Math.min(Math.max(0, companyTaxBase), lossAvailable);
-  const taxableIncome  = Math.max(0, companyTaxBase - lossUsed);
-  const totalTax       = Math.round(taxableIncome * taxRate);
+  const lossUsed       = isFinal ? 0 : Math.min(Math.max(0, companyTaxBase), lossAvailable);
+  const taxableIncome  = isFinal ? Math.max(0, companyTaxBase) : Math.max(0, companyTaxBase - lossUsed);
   const taxableRatio   = companyTaxBase > 0 ? (taxableIncome / companyTaxBase) : 0;
+
+  // 段階税率での自動計算（見込み用）。手入力があればそれを優先する
+  const tax = computeCorporateTax(isFinal ? 0 : taxableIncome, state.adminTaxBrackets, taxRate);
+  const hasOverride = f.taxOverride !== null && f.taxOverride !== undefined && f.taxOverride !== '';
+  const autoTax = isFinal ? Math.round((companyTaxActual||0) * tradeRatio) : tax.total;
+  const totalTax = hasOverride ? Math.max(0, Math.round(Number(f.taxOverride)||0)) : autoTax;
+  const effectiveRate = taxableIncome > 0 ? (totalTax / taxableIncome) : 0;
 
   // 法人税の合計を黒字社員の課税ベース比率で按分(端数は最後の黒字社員に寄せる)
   const positiveRows = rows.filter(r => r.taxBase > 0);
@@ -1037,7 +1125,11 @@ function computeYearSettlement(f){
     r.already         = (state.adminSettlements||[]).find(s => s.employee_id === r.emp.id && s.fiscal_year_end === f.end) || null;
   });
 
-  return { rows, companyTaxBase, lossAvailable, lossUsed, taxableIncome, taxableRatio, totalTax, taxRate, splitRate };
+  return { rows, companyTaxBase, lossAvailable, lossUsed, taxableIncome, taxableRatio,
+           totalTax, autoTax, hasOverride, effectiveRate,
+           isFinal, finalReady, companyIncome, companyTaxActual, tradeRatio, hasPL: !!pl,
+           breakdown: tax.breakdown, nextThreshold: tax.nextThreshold, nextRate: tax.nextRate,
+           bracketsConfigured: tax.configured, taxRate, splitRate };
 }
 
 /* ---------------------------------------------------------------------
@@ -1073,7 +1165,7 @@ function estimateCurrentSettlementAll(splitRate){
   const companyTaxBase = active.reduce((s,r) => s + r.taxBase, 0);
   const lossUsed       = Math.min(Math.max(0, companyTaxBase), lossAvailable);
   const taxableIncome  = Math.max(0, companyTaxBase - lossUsed);
-  const totalTax       = Math.round(taxableIncome * taxRate);
+  const totalTax       = computeCorporateTax(taxableIncome, state.adminTaxBrackets, taxRate).total;
 
   const positiveRows = active.filter(r => r.taxBase > 0);
   const positiveBaseTotal = positiveRows.reduce((s,r) => s + r.taxBase, 0);
@@ -1099,25 +1191,40 @@ function estimateCurrentSettlementAll(splitRate){
    繰越欠損金は会社単位で消し込むため、社員ごとに確定すると二重に減ってしまう。
    そのため確定は年度単位の一括処理にしている。
 --------------------------------------------------------------------- */
-async function confirmYearSettlement(){
+async function confirmYearSettlement(isRevision){
   const f = state.settlementForm;
   if(!f) return;
   const calc = computeYearSettlement(f);
-  const targets = calc.rows.filter(r => !r.already);
-  if(!targets.length){ alert('この年度は全社員すでに記録済みです。'); return; }
+  const targets = isRevision ? calc.rows : calc.rows.filter(r => !r.already);
+  if(!targets.length){ alert('対象の社員がいません。'); return; }
+
+  // 修正の場合は、前回確定した社員取り分との差額だけをインセンティブに反映する
+  const prevOf = r => (r.already ? Number(r.already.employee_settlement_amount || 0) : 0);
+  const detail = targets.map(r => isRevision
+    ? `  ${r.emp.name}: ${yen(Math.round(prevOf(r)))} → ${yen(Math.round(r.employeeAmount))}（差額 ${r.employeeAmount - prevOf(r) >= 0 ? '+' : ''}${yen(Math.round(r.employeeAmount - prevOf(r)))}）`
+    : `  ${r.emp.name}: ${yen(Math.round(r.employeeAmount))}`
+  ).join('\n');
 
   const ok = confirm(
-    `${f.start} 〜 ${f.end} の年次精算を確定します。\n\n` +
-    `対象社員: ${targets.map(r=>r.emp.name).join('、')}\n` +
+    `${f.start} 〜 ${f.end} の年次精算を${isRevision ? '修正' : '確定'}します。\n\n` +
     `会社の課税ベース合計: ${yen(Math.round(calc.companyTaxBase))}\n` +
     `繰越欠損金の充当額: ${yen(Math.round(calc.lossUsed))}\n` +
     `課税対象額: ${yen(Math.round(calc.taxableIncome))}\n` +
-    `法人税の合計: ${yen(calc.totalTax)}\n\n` +
-    `繰越欠損金は発生年度の古いものから自動で消し込まれます。よろしいですか？`
+    `法人税の合計: ${yen(calc.totalTax)}${calc.hasOverride ? '（手入力）' : ''}\n\n` +
+    `社員取り分:\n${detail}\n\n` +
+    (isRevision
+      ? `この年度の繰越欠損金の消し込みは、いったん取り消してから計算し直します。\nインセンティブ台帳には差額の調整だけが追加されます。よろしいですか？`
+      : `繰越欠損金は発生年度の古いものから自動で消し込まれます。よろしいですか？`)
   );
   if(!ok) return;
 
   const { data:{ user } } = await sb.auth.getUser();
+
+  // 修正時はまず、この年度の繰越欠損金の消し込みを巻き戻す
+  if(isRevision){
+    const reversed = await reverseLossCarryforward(f.end);
+    if(!reversed) return;
+  }
 
   for(const r of targets){
     const { data: settlement, error } = await sb.from('annual_settlements').upsert({
@@ -1134,29 +1241,69 @@ async function confirmYearSettlement(){
       loss_used_total: calc.lossUsed,
       taxable_ratio: calc.taxableRatio,
       company_tax_active: calc.totalTax > 0,
-      tax_rate_used: calc.taxRate,
+      tax_rate_used: calc.effectiveRate,
+      tax_total_override: calc.hasOverride ? calc.totalTax : null,
+      tax_note: (f.taxNote || null),
+      tax_source: calc.isFinal ? 'final' : 'estimate',
+      company_taxable_income: calc.isFinal ? calc.companyIncome : null,
+      company_tax_actual: calc.isFinal ? calc.companyTaxActual : null,
+      trade_share_ratio: calc.isFinal ? calc.tradeRatio : null,
       tax_cost: r.taxCost,
       distributable: r.distributable,
       split_rate: calc.splitRate,
       employee_settlement_amount: r.employeeAmount,
       company_share: r.companyShare,
+      revised_at: (isRevision ? new Date().toISOString() : null),
       created_by: user.id
     }, { onConflict: 'employee_id,fiscal_year_end' }).select().single();
 
     if(error){ alert(`${r.emp.name} の精算保存に失敗しました: ${error.message}`); return; }
 
-    await sb.from('incentive_ledger').insert({
-      employee_id: r.emp.id,
-      entry_type: 'annual_settlement',
-      amount: r.employeeAmount,
-      status: 'completed',
-      related_settlement_id: settlement.id,
-      note: `${f.start} 〜 ${f.end} の年次精算`
-    });
+    // 新規は取り分をそのまま、修正は前回との差額だけを台帳に追加する
+    const amount = isRevision ? (r.employeeAmount - prevOf(r)) : r.employeeAmount;
+    if(amount !== 0){
+      await sb.from('incentive_ledger').insert({
+        employee_id: r.emp.id,
+        entry_type: 'annual_settlement',
+        amount,
+        status: 'completed',
+        related_settlement_id: settlement.id,
+        note: isRevision
+          ? `${f.start} 〜 ${f.end} の年次精算の修正` + (f.taxNote ? `（${f.taxNote}）` : '')
+          : `${f.start} 〜 ${f.end} の年次精算`
+      });
+    }
   }
 
-  await consumeLossCarryforward(calc.lossUsed, f.end);
+  if(!calc.isFinal){
+    await consumeLossCarryforward(calc.lossUsed, f.end);
+  }
   loadAdminData();
+}
+
+/* ---------------------------------------------------------------------
+   繰越欠損金の消し込みを年度単位で巻き戻す（精算を修正するとき用）
+   loss_carryforward_usages に「どの発生年度をいくら使ったか」を残しているので、
+   それを逆に足し戻して履歴を削除する。
+--------------------------------------------------------------------- */
+async function reverseLossCarryforward(fiscalYearEnd){
+  const usages = (state.adminLossUsages||[]).filter(u => u.fiscal_year_end === fiscalYearEnd);
+  for(const u of usages){
+    const v = (state.adminLoss||[]).find(l => l.id === u.vintage_id);
+    if(v){
+      const used      = Math.max(0, Number(v.used_amount||0) - Number(u.amount||0));
+      const remaining = Number(v.remaining_amount||0) + Number(u.amount||0);
+      const { error } = await sb.from('loss_carryforward_vintages')
+        .update({ used_amount: used, remaining_amount: remaining }).eq('id', v.id);
+      if(error){ alert('繰越欠損金の巻き戻しに失敗しました: '+error.message); return false; }
+      v.used_amount = used;            // 直後の消し込み計算がこの値を見るのでローカルも更新
+      v.remaining_amount = remaining;
+    }
+    const { error: delErr } = await sb.from('loss_carryforward_usages').delete().eq('id', u.id);
+    if(delErr){ alert('消し込み履歴の削除に失敗しました: '+delErr.message); return false; }
+  }
+  state.adminLossUsages = (state.adminLossUsages||[]).filter(u => u.fiscal_year_end !== fiscalYearEnd);
+  return true;
 }
 
 /* 繰越欠損金を発生年度の古いものから順に消し込む(先入先出) */
@@ -2140,9 +2287,12 @@ function adminSettlementHtml(){
       companyId: state.adminCompanyId,
       start: defaultYear.start,
       end: defaultYear.end,
-      taxRate: 0.30,
+      taxRate: 0.30,       // 税率テーブル未登録のときのフォールバック
       splitRate: 0.5,
       lossOverride: null,  // null なら「繰越欠損金」タブの登録残高をそのまま使う
+      taxOverride: null,   // null なら自動計算
+      taxNote: '',
+      taxSource: 'estimate',  // estimate = アプリの段階税率 / final = 決算書の実額から按分
     };
   }
   const f = state.settlementForm;
@@ -2151,7 +2301,12 @@ function adminSettlementHtml(){
     `<option value="${y.start}|${y.end}" ${y.start===f.start?'selected':''}>${y.label}</option>`
   ).join('');
 
-  const registeredLoss = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
+  const currentLoss = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
+  // この年度ですでに消し込んだ分は、修正時に巻き戻すので使える側に戻して考える
+  const usedThisYear = (state.adminLossUsages||[])
+    .filter(u => u.fiscal_year_end === f.end)
+    .reduce((s,u)=> s + Number(u.amount||0), 0);
+  const registeredLoss = currentLoss + usedThisYear;
   f.lossAvailable = (f.lossOverride === null || f.lossOverride === undefined) ? registeredLoss : f.lossOverride;
 
   const selectedYear = years.find(y=>y.start===f.start);
@@ -2163,7 +2318,17 @@ function adminSettlementHtml(){
 
   // 課税状況の説明文
   let taxNote;
-  if(calc.companyTaxBase <= 0){
+  if(calc.isFinal){
+    if(!calc.hasPL){
+      taxNote = `<strong style="color:var(--warn)">この年度の簡易PLが未登録です。</strong>「簡易PL」タブで、決算書の「所得金額(繰越欠損金の控除前)」と「法人税等(実績)」を登録してください。`;
+    } else if(!calc.finalReady){
+      taxNote = `<strong style="color:var(--warn)">簡易PLに必要な数字が足りません。</strong>「簡易PL」タブで、この年度の「所得金額(繰越欠損金の控除前)」と「法人税等(実績)」の両方を登録してください。`;
+    } else if(calc.companyIncome <= 0){
+      taxNote = `決算書の所得金額が ${yen(Math.round(calc.companyIncome))} のため、トレード分に配分する法人税はありません。`;
+    } else {
+      taxNote = `決算書の法人税等 <strong>${yen(Math.round(calc.companyTaxActual))}</strong> のうち、会社全体の所得 ${yen(Math.round(calc.companyIncome))} に対するトレードの課税ベース ${yen(Math.round(calc.companyTaxBase))} の割合(<strong>${(calc.tradeRatio*100).toFixed(2)}%</strong>)を掛けた <strong>${yen(calc.totalTax)}</strong> をトレード分の税額としています。賃料など他の収益で税率区分が上がった影響も、繰越欠損金が実際にどれだけ使われたかも、この実額にすでに含まれています。`;
+    }
+  } else if(calc.companyTaxBase <= 0){
     taxNote = 'この年度は会社全体の課税ベースがマイナスのため、法人税は発生しません。';
   } else if(calc.taxableIncome <= 0){
     taxNote = `課税ベース ${yen(Math.round(calc.companyTaxBase))} は繰越欠損金で全額相殺できるため、法人税は発生しません。`;
@@ -2193,34 +2358,92 @@ function adminSettlementHtml(){
     </div>`
   ).join('') || `<div class="card"><p class="empty">社員が登録されていません</p></div>`;
 
-  const btnLabel = allSettled ? 'この年度は記録済みです'
-                 : isCurrentYear ? '進行中の年度は確定できません'
+  // 確定済みの年度は「修正」モードになる（決算書の数字が出たあとに直せるように）
+  const btnLabel = isCurrentYear ? '進行中の年度は確定できません'
+                 : allSettled ? 'この年度を修正して差額をインセンティブに反映'
                  : 'この年度を確定してインセンティブに反映(全社員まとめて)';
+
+  // 税額の内訳
+  const breakdownRows = calc.breakdown.map(b => `<tr>
+    <td>${yen(Math.round(b.from))} 〜 ${isFinite(b.to) ? yen(Math.round(b.to)) : '上限なし'}</td>
+    <td class="num">${yen(Math.round(b.part))}</td>
+    <td class="num">${(b.rate*100).toFixed(2)}%</td>
+    <td class="num">${yen(Math.round(b.amount))}</td>
+  </tr>`).join('') || `<tr><td colspan="4" class="empty">課税対象額がないため税額は発生しません</td></tr>`;
+
+  // 次に税率が変わる金額まであといくらか
+  const toNext = (calc.nextThreshold !== null && calc.taxableIncome > 0)
+    ? calc.nextThreshold - calc.taxableIncome : null;
+  const nearThreshold = toNext !== null && toNext <= 1000000;
+  const thresholdNote = toNext === null ? '' : `
+    <div class="desc" style="margin-top:10px;${nearThreshold?'color:var(--warn);font-weight:600;':''}">
+      ${nearThreshold?'⚠︎ ':''}課税対象額があと <strong>${yen(Math.round(toNext))}</strong> 増えると、
+      ${yen(Math.round(calc.nextThreshold))} を超えて税率が
+      ${calc.nextRate !== null ? (calc.nextRate*100).toFixed(2)+'%' : '次の区分'} に上がります。
+      ${nearThreshold?'ぎりぎりの水準なので、決算書の数字が出てから確定するか、法人税を手入力で調整することを検討してください。':''}
+    </div>`;
 
   return `
   <div class="card">
     <h2>年次精算</h2>
-    <div class="desc">この会社の決算期: 毎年${fiscalStartMonth}月開始。法人税は会社全体の課税ベースで判定し、繰越欠損金を差し引いた残りの課税対象額に対する税額を、各社員の課税ベースの比率で按分します。</div>
+    <div class="desc">この会社の決算期: 毎年${fiscalStartMonth}月開始。${calc.isFinal
+      ? '<strong>決算確定値モード</strong>です。決算書の法人税等のうち、トレードの課税ベースが会社全体の所得に占める割合分をトレード分の税額とし、各社員の課税ベースの比率で按分します。'
+      : '<strong>見込みモード</strong>です。会社全体の課税ベースで判定し、繰越欠損金を差し引いた残りの課税対象額に対する税額を、各社員の課税ベースの比率で按分します。トレード以外の収益は含まれないため、確定値は決算後に「決算確定値」で出し直してください。'}</div>
     <div class="row">
       <div>
         <label>対象年度</label>
         <select onchange="const [s,e]=this.value.split('|'); state.settlementForm.start=s; state.settlementForm.end=e; renderAdminTabContent();">${yearOptions}</select>
       </div>
       <div>
-        <label>控除に使える繰越欠損金<span class="muted" style="font-weight:400;">(登録残高: ${yen(registeredLoss)})</span></label>
-        <input type="number" step="1" value="${Math.round(f.lossAvailable)}" onchange="state.settlementForm.lossOverride=Number(this.value); renderAdminTabContent();" />
+        <label>税額の出し方</label>
+        <select onchange="state.settlementForm.taxSource=this.value; state.settlementForm.taxOverride=null; renderAdminTabContent();">
+          <option value="estimate" ${!calc.isFinal?'selected':''}>見込み(アプリの段階税率で計算)</option>
+          <option value="final" ${calc.isFinal?'selected':''}>決算確定値(決算書の法人税等から按分)</option>
+        </select>
       </div>
     </div>
     <div class="row" style="margin-top:10px;">
-      <div><label>法人税率</label><input type="number" step="0.01" value="${f.taxRate}" onchange="state.settlementForm.taxRate=Number(this.value); renderAdminTabContent();" /></div>
+      <div>
+        <label>控除に使える繰越欠損金<span class="muted" style="font-weight:400;">${calc.isFinal?'(決算確定値モードでは使いません)':`(残高 ${yen(currentLoss)}${usedThisYear>0?` + この年度で消し込み済みの ${yen(usedThisYear)} を戻した額`:''})`}</span></label>
+        <input type="number" step="1" ${calc.isFinal?'disabled':''} value="${Math.round(f.lossAvailable)}" onchange="state.settlementForm.lossOverride=Number(this.value); renderAdminTabContent();" />
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px;">
+      <div>
+        <label>法人税の合計<span class="muted" style="font-weight:400;">(決算書が出たらここに実額を入力)</span></label>
+        <input type="number" step="1" placeholder="空欄なら自動計算 ${yen(calc.autoTax)}"
+               value="${calc.hasOverride ? Math.round(calc.totalTax) : ''}"
+               onchange="state.settlementForm.taxOverride = (this.value === '' ? null : Number(this.value)); renderAdminTabContent();" />
+      </div>
       <div><label>分配比率(社員側)</label><input type="number" step="0.05" value="${f.splitRate}" onchange="state.settlementForm.splitRate=Number(this.value); renderAdminTabContent();" /></div>
     </div>
+    ${calc.hasOverride ? `<div class="row" style="margin-top:10px;">
+      <div style="flex:1"><label>修正の理由(任意)</label><input type="text" placeholder="例: 決算報告書の法人税等より転記"
+             value="${(f.taxNote||'').replace(/"/g,'&quot;')}"
+             onchange="state.settlementForm.taxNote=this.value;" /></div>
+    </div>` : ''}
     ${f.lossOverride !== null && f.lossOverride !== undefined && f.lossOverride !== registeredLoss
       ? `<div class="desc" style="margin-top:10px;">⚠︎ 繰越欠損金を手動で上書きしています。<a href="#" onclick="state.settlementForm.lossOverride=null; renderAdminTabContent(); return false;">登録残高(${yen(registeredLoss)})に戻す</a></div>` : ''}
+    ${calc.hasOverride
+      ? `<div class="desc" style="margin-top:10px;">⚠︎ 法人税を手入力の ${yen(calc.totalTax)} で計算しています(自動計算なら ${yen(calc.autoTax)})。<a href="#" onclick="state.settlementForm.taxOverride=null; renderAdminTabContent(); return false;">自動計算に戻す</a></div>` : ''}
   </div>
 
   <div class="card">
     <h2>会社全体の税額計算</h2>
+    ${calc.isFinal ? `
+    <div class="row">
+      <div class="stat"><div class="label">トレードの課税ベース合計</div><div class="value ${calc.companyTaxBase<0?'negative':'positive'}">${yen(Math.round(calc.companyTaxBase))}</div></div>
+      <div class="stat"><div class="label">会社全体の所得(決算書・欠損金控除前)</div><div class="value">${calc.finalReady?yen(Math.round(calc.companyIncome)):'—'}</div></div>
+      <div class="stat"><div class="label">法人税等(決算書の実額)</div><div class="value">${calc.finalReady?yen(Math.round(calc.companyTaxActual)):'—'}</div></div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <div class="stat"><div class="label">トレード分の按分割合</div><div class="value">${calc.finalReady?(calc.tradeRatio*100).toFixed(2)+'%':'—'}</div></div>
+      <div class="stat"><div class="label">トレード分の法人税${calc.hasOverride?'(手入力)':''}</div><div class="value">${yen(calc.totalTax)}</div></div>
+      <div class="stat"><div class="label">繰越欠損金</div><div class="value muted" style="font-size:15px">別表七で管理</div></div>
+    </div>
+    <div class="desc" style="margin-top:12px;">${taxNote}</div>
+    <div class="desc" style="margin-top:10px;">※ 決算確定値モードでは繰越欠損金の自動消し込みは行いません。決算後に「繰越欠損金」タブで別表七の残高に更新してください。</div>
+    ` : `
     <div class="row">
       <div class="stat"><div class="label">課税ベース合計(全社員通算)</div><div class="value ${calc.companyTaxBase<0?'negative':'positive'}">${yen(Math.round(calc.companyTaxBase))}</div></div>
       <div class="stat"><div class="label">繰越欠損金の充当額</div><div class="value">${yen(Math.round(calc.lossUsed))}</div></div>
@@ -2228,15 +2451,61 @@ function adminSettlementHtml(){
     </div>
     <div class="row" style="margin-top:14px;">
       <div class="stat"><div class="label">実効課税割合</div><div class="value">${ratioPct}%</div></div>
-      <div class="stat"><div class="label">法人税の合計(税率${(calc.taxRate*100).toFixed(0)}%)</div><div class="value">${yen(calc.totalTax)}</div></div>
+      <div class="stat"><div class="label">法人税の合計${calc.hasOverride?'(手入力)':''}</div><div class="value">${yen(calc.totalTax)}<span class="muted" style="font-size:12px;font-weight:400;"> / 実効${(calc.effectiveRate*100).toFixed(2)}%</span></div></div>
       <div class="stat"><div class="label">精算後の繰越欠損金残高</div><div class="value">${yen(Math.round(Math.max(0, registeredLoss - calc.lossUsed)))}</div></div>
     </div>
     <div class="desc" style="margin-top:12px;">${taxNote}</div>
+    ${thresholdNote}
+    <h3 style="margin-top:18px;margin-bottom:8px;font-size:14px;">税額の内訳${calc.hasOverride?'(自動計算・参考)':''}</h3>
+    <table>
+      <thead><tr><th>所得区分</th><th class="num">この区分の金額</th><th class="num">実効税率</th><th class="num">税額</th></tr></thead>
+      <tbody>${breakdownRows}</tbody>
+    </table>
+    ${!calc.bracketsConfigured ? `<div class="desc" style="margin-top:10px;color:var(--warn)">⚠︎ 税率テーブルが未登録のため、一律 ${(calc.taxRate*100).toFixed(0)}% で計算しています。migration_tax_brackets.sql を実行してください。</div>` : ''}
+    <div class="desc" style="margin-top:10px;">※ このアプリはトレード部分しか把握していないため、不動産賃料など他の収益があると実際の税率区分とはズレます。決算が終わったら「決算確定値」に切り替えて確定し直してください。</div>
+    `}
     <div style="margin-top:16px;">
-      <button class="btn-accent" ${(allSettled||isCurrentYear)?'disabled':''} onclick="confirmYearSettlement()">${btnLabel}</button>
+      <button class="btn-accent" ${isCurrentYear?'disabled':''} onclick="confirmYearSettlement(${allSettled ? 'true' : 'false'})">${btnLabel}</button>
+      ${allSettled?`<div class="desc" style="margin-top:8px;">確定済みの年度です。上の金額を直したうえでこのボタンを押すと、<strong>前回との差額だけ</strong>がインセンティブ台帳に追加され、繰越欠損金の消し込みもやり直されます。</div>`:''}
     </div>
   </div>
+  ${calc.isFinal ? '' : adminTaxBracketHtml()}
   ${rows}`;
+}
+
+/* ---------------------------------------------------------------------
+   法人税の税率テーブル(所得区分別)の編集
+--------------------------------------------------------------------- */
+function adminTaxBracketHtml(){
+  const list = (state.adminTaxBrackets||[]).slice().sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));
+  const rows = list.map((b,i) => `<tr>
+    <td class="muted">${i+1}</td>
+    <td>${b.upper_limit === null || b.upper_limit === undefined
+          ? '<span class="muted">それ以上すべて</span>'
+          : `<input type="number" step="1" style="max-width:150px" value="${Number(b.upper_limit)}"
+                    onchange="updateTaxBracket('${b.id}','upper_limit',this.value)" /> まで`}</td>
+    <td><input type="number" step="0.0001" style="max-width:110px" value="${Number(b.rate)}"
+               onchange="updateTaxBracket('${b.id}','rate',this.value)" /></td>
+    <td class="num">${(Number(b.rate)*100).toFixed(2)}%</td>
+  </tr>`).join('') || `<tr><td colspan="4" class="empty">税率が登録されていません。migration_tax_brackets.sql を実行してください。</td></tr>`;
+
+  return `
+  <div class="card">
+    <h2>法人税の税率(所得区分別)</h2>
+    <div class="desc">課税対象額を区分ごとに切って積み上げる累進計算に使います。初期値は中小法人(資本金1億円以下・外形標準課税対象外)の法定実効税率です。<strong>所在地の自治体や法改正で変わるので、顧問税理士に確認して調整してください。</strong>税率は 0.3358 のように小数で入力します。</div>
+    <table>
+      <thead><tr><th>区分</th><th>この金額まで</th><th>実効税率</th><th class="num">%</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+async function updateTaxBracket(id, field, value){
+  const v = (value === '' ? null : Number(value));
+  if(field === 'rate' && (v === null || v < 0 || v > 1)){ alert('税率は 0〜1 の小数で入力してください(例: 33.58% なら 0.3358)'); renderAdminTabContent(); return; }
+  const { error } = await sb.from('corporate_tax_brackets').update({ [field]: v }).eq('id', id);
+  if(error){ alert('更新に失敗しました: '+error.message); return; }
+  loadAdminData();
 }
 
 /* 日付文字列に日数を加算 */
@@ -2262,6 +2531,7 @@ function adminPLHtml(){
         <div class="stat"><div class="label">税引前利益</div><div class="value ${p.pretax_profit<0?'negative':'positive'}">${yen(p.pretax_profit)}</div></div>
       </div>
       <div class="row" style="margin-top:14px;">
+        <div class="stat"><div class="label">所得金額(欠損金控除前)</div><div class="value ${p.taxable_income_before_loss==null?'muted':''}" ${p.taxable_income_before_loss==null?'style="font-size:15px"':''}>${p.taxable_income_before_loss==null?'未入力':yen(p.taxable_income_before_loss)}</div></div>
         <div class="stat"><div class="label">当期の法人税等(実績)</div><div class="value">${yen(p.tax_amount)}</div></div>
         <div class="stat"><div class="label">当期純利益(実績)</div><div class="value">${yen(p.net_profit)}</div></div>
         <div class="stat"><div class="label">繰越欠損金(残${yen(Math.round(remainingLoss))})を差し引いた想定税引後利益</div><div class="value">${yen(netAfterTaxEstimate)}</div></div>
@@ -2277,7 +2547,7 @@ function adminPLHtml(){
     ${rows}
     <div class="card">
       <h2>年度PLを追加・更新</h2>
-      <div class="desc">決算書PDFの数値を転記してください。同じ「期末日」で登録すると上書きされます。</div>
+      <div class="desc">決算書PDFの数値を転記してください。同じ「期末日」で登録すると上書きされます。<br><strong>「所得金額(繰越欠損金の控除前)」と「法人税等(実績)」を入れると、年次精算を「決算確定値」で確定できるようになります。</strong>この2つから、トレード分の法人税を所得の比率で按分します。</div>
       <div class="row">
         <div><label>期首</label><input type="date" id="pl-start" /></div>
         <div><label>期末</label><input type="date" id="pl-end" /></div>
@@ -2291,6 +2561,12 @@ function adminPLHtml(){
         <div><label>税引前利益</label><input type="number" id="pl-pretax" /></div>
         <div><label>法人税等(実績)</label><input type="number" id="pl-tax" /></div>
         <div><label>当期純利益(実績)</label><input type="number" id="pl-net" /></div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <div style="flex:1">
+          <label>所得金額(繰越欠損金の控除前)<span class="muted" style="font-weight:400;"> ← 別表四の「差引計」。年次精算を決算確定値で行うのに必要です</span></label>
+          <input type="number" id="pl-taxable" />
+        </div>
       </div>
       <div class="row" style="margin-top:10px;">
         <div><label>想定実効税率(欠損金を使い切った後)</label><input type="number" step="0.01" id="pl-rate" value="0.30" /></div>
@@ -2313,6 +2589,7 @@ function submitPLForm(){
     pretax: Number(document.getElementById('pl-pretax').value)||null,
     tax: Number(document.getElementById('pl-tax').value)||null,
     net: Number(document.getElementById('pl-net').value)||null,
+    taxable: Number(document.getElementById('pl-taxable').value)||null,
     rate: Number(document.getElementById('pl-rate').value)||0.30,
     notes: document.getElementById('pl-notes').value,
   });
@@ -2325,9 +2602,12 @@ function adminLossHtml(){
     const soon = expiry && ((expiry - today) / (1000*60*60*24*365) < 2);
     return `<tr>
       <td>${l.fiscal_year_start} 〜 ${l.fiscal_year_end}</td>
-      <td class="num">${yen(l.incurred_amount)}</td>
-      <td class="num">${yen(l.used_amount)}</td>
-      <td class="num"><strong>${yen(l.remaining_amount)}</strong></td>
+      <td class="num"><input type="number" step="1" style="max-width:130px;text-align:right" value="${Number(l.incurred_amount||0)}"
+             onchange="updateLossVintage('${l.id}','incurred_amount',this.value)" /></td>
+      <td class="num"><input type="number" step="1" style="max-width:130px;text-align:right" value="${Number(l.used_amount||0)}"
+             onchange="updateLossVintage('${l.id}','used_amount',this.value)" /></td>
+      <td class="num"><input type="number" step="1" style="max-width:130px;text-align:right;font-weight:700" value="${Number(l.remaining_amount||0)}"
+             onchange="updateLossVintage('${l.id}','remaining_amount',this.value)" /></td>
       <td class="${soon?'loss-expiry-warn':''}">${l.expiry_fiscal_year_end || '—'}${soon?' ⚠︎期限間近':''}</td>
       <td class="muted">${l.source_document||''}</td>
       <td><button class="row-delete" onclick="deleteLoss('${l.id}')">削除</button></td>
@@ -2349,6 +2629,7 @@ function adminLossHtml(){
   </div>
   <div class="card">
     <h2>発生年度別の内訳</h2>
+    <div class="desc">決算が終わったら、<strong>別表七の期末残高に合わせてここを直接更新してください。</strong>会社全体では不動産賃料などトレード以外の所得でも欠損金が使われるため、アプリの自動消し込み(期中の見込み用)とは差が出ます。決算書の数字が正です。</div>
     <table>
       <thead><tr><th>発生事業年度</th><th class="num">発生額</th><th class="num">控除済み累計</th><th class="num">繰越残額</th><th>失効期限</th><th>出典</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
@@ -2441,6 +2722,15 @@ function computeRetainedSummary(){
   };
 
   return { perEmployee, yearData, totals };
+}
+
+/* 繰越欠損金の金額を直接編集する（決算後に別表七の数字へ合わせる用） */
+async function updateLossVintage(id, field, value){
+  const v = Number(value);
+  if(isNaN(v) || v < 0){ alert('0以上の数字を入力してください'); renderAdminTabContent(); return; }
+  const { error } = await sb.from('loss_carryforward_vintages').update({ [field]: v }).eq('id', id);
+  if(error){ alert('更新に失敗しました: '+error.message); return; }
+  loadAdminData();
 }
 
 function submitLossForm(){
