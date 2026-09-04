@@ -137,6 +137,7 @@
   table{width:100%;border-collapse:collapse;font-size:13.5px;}
   th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--border);}
   th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em;}
+  tr.total-row td{background:var(--accent-soft);font-weight:700;border-bottom:2px solid var(--accent);}
   td.num, th.num{text-align:right;}
   tr:last-child td{border-bottom:none;}
 
@@ -374,7 +375,7 @@ async function submitEmployeePin(pin){
   const errEl = document.getElementById('pin-error');
   const { data, error } = await sb.rpc('verify_employee_pin', { pin, target_employee_id: state.selectedEmployeeId });
   if(error || !data){
-    if(errEl) errEl.textContent = 'PINが違います。もう一度お試しください。';
+    if(errEl) errEl.textContent = 'PINが違います。5回続けて間違えると15分間ログインできなくなります。';
     return;
   }
   await enterEmployee(state.selectedEmployeeId);
@@ -474,7 +475,7 @@ function incentiveAvailable(ledgerEntries){
    - DBには保存せず、常に最新の残高・入出金から算出するため、
      残高の修正・削除にも自動で追従する
 --------------------------------------------------------------------- */
-function estimateCurrentSettlement(accounts, balancesByAccount, cashflowsByAccount, monthlySalary, settlements, splitRate){
+function estimateCurrentSettlement(accounts, balancesByAccount, cashflowsByAccount, monthlySalary, settlements, splitRate, employee){
   splitRate = splitRate ?? 0.5;
   const settled = (settlements||[]).slice().sort((a,b)=>b.fiscal_year_end.localeCompare(a.fiscal_year_end));
   const periodStart = settled.length ? settled[0].fiscal_year_end : null; // この日「まで」は精算済み
@@ -510,10 +511,11 @@ function estimateCurrentSettlement(accounts, balancesByAccount, cashflowsByAccou
   }
   if(!hasData) return null;
 
-  // 経過月数(開始月の翌月から現在の月まで)
-  const sy = Number(startDate.slice(0,4)), sm = Number(startDate.slice(5,7));
+  // 経過月数(開始月の翌月から現在の月まで)を、稼働開始月・稼働終了月で切り取る
   const now = new Date();
-  const months = Math.max(1, (now.getUTCFullYear()-sy)*12 + (now.getUTCMonth()+1-sm));
+  const periodFrom = serialToYm(monthSerial(startDate) + 1);
+  const periodTo   = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
+  const months = activeMonthsInPeriod(employee, periodFrom, periodTo);
   const salaryCost = Number(monthlySalary||0) * months;
 
   const distributable = profit - salaryCost;
@@ -564,6 +566,23 @@ async function deleteBalanceEmployee(id){
   loadEmployeeData();
 }
 
+/* 社員が自分のログインPINを変更する(現在のPINが必要) */
+async function changeMyPin(){
+  const cur  = (document.getElementById('pin-cur')?.value  || '').trim();
+  const next = (document.getElementById('pin-new')?.value  || '').trim();
+  const conf = (document.getElementById('pin-new2')?.value || '').trim();
+  if(!/^[0-9]{4,6}$/.test(next)){ alert('新しいPINは4〜6桁の数字で入力してください'); return; }
+  if(next !== conf){ alert('新しいPINが一致しません'); return; }
+  const { error } = await sb.rpc('set_employee_pin', {
+    target_employee_id: state.session.employeeId,
+    new_pin: next,
+    current_pin: cur
+  });
+  if(error){ alert(error.message || '変更に失敗しました'); return; }
+  ['pin-cur','pin-new','pin-new2'].forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
+  alert('PINを変更しました。次回のログインから新しいPINを使ってください。');
+}
+
 async function requestWithdrawal(amount, note){
   if(!amount || amount<=0){ alert('金額を入力してください'); return; }
   const available = incentiveAvailable(state.myIncentiveLedger);
@@ -585,8 +604,8 @@ async function requestWithdrawal(amount, note){
 async function downloadBackup(){
   const tables = [
     'companies','employees','trading_accounts','monthly_balances',
-    'expenses','account_cashflows','incentive_ledger','annual_settlements',
-    'company_pl_summary','loss_carryforward_vintages'
+    'expenses','annual_expenses','account_cashflows','incentive_ledger','annual_settlements',
+    'company_pl_summary','loss_carryforward_vintages','loss_carryforward_usages'
   ];
   const backup = { exported_at: new Date().toISOString() };
   for(const t of tables){
@@ -650,6 +669,9 @@ async function loadAdminData(){
   const { data: loss } = await sb.from('loss_carryforward_vintages').select('*').eq('company_id', companyId).order('fiscal_year_end', {ascending:false});
   state.adminLoss = loss || [];
 
+  const { data: lossUsages } = await sb.from('loss_carryforward_usages').select('*').eq('company_id', companyId).order('fiscal_year_end', {ascending:false});
+  state.adminLossUsages = lossUsages || [];
+
   state.adminCashflows = {};
   for(const acc of state.adminAccounts){
     const { data: cfs } = await sb.from('account_cashflows').select('*').eq('account_id', acc.id).order('flow_date', {ascending:false});
@@ -688,9 +710,21 @@ function switchAdminTab(tab){
 }
 
 
-async function addEmployee(name, salary){
-  const { error } = await sb.from('employees').insert({ company_id: state.adminCompanyId, name, monthly_salary: salary });
+async function addEmployee(name, salary, startedYm){
+  const { error } = await sb.from('employees').insert({
+    company_id: state.adminCompanyId, name, monthly_salary: salary,
+    started_on: startedYm ? `${startedYm}-01` : null
+  });
   if(error){ alert('登録に失敗しました: '+error.message); return; }
+  loadAdminData();
+}
+
+/* 稼働開始月・稼働終了月の更新(月初の日付として保存する) */
+async function updateEmployeeMonth(id, field, ym){
+  if(field !== 'started_on' && field !== 'ended_on') return;
+  const value = ym ? `${ym}-01` : null;
+  const { error } = await sb.from('employees').update({ [field]: value }).eq('id', id);
+  if(error){ alert('更新に失敗しました: '+error.message); return; }
   loadAdminData();
 }
 async function addAccount(name, employeeId){
@@ -896,50 +930,269 @@ function monthlySeriesForAccount(accountId, balancesMap, cashflowsMap){
 }
 
 /* ---------------------------------------------------------------------
-   年次精算の保存
+   年次精算の計算
+   ---------------------------------------------------------------------
+   ■ 課税所得のベース
+     社員ごとに 投資収益 − 年間固定給 − 年度経費。
+     年度経費は「会社負担」「インセンティブから控除」の両方を含める
+     (どちらも会社が実際に支払った費用のため、税務上はどちらも損金)。
+
+   ■ 法人税は会社全体で判定する
+     会社課税ベース = 全社員の課税ベースの合計(赤字社員の損失も通算)
+     欠損金の充当額 = min(max(0, 会社課税ベース), 繰越欠損金の残高)
+     課税対象額     = max(0, 会社課税ベース − 充当額)
+     法人税の合計   = 課税対象額 × 税率
+
+   ■ 繰越欠損金を使い切る年の按分
+     使い切る年は「利益の一部だけ」が課税対象になる。その法人税の合計額を、
+     黒字社員の課税ベースの比率でそのまま比例配分する。端数は最後の黒字社員
+     で吸収し、按分額の合計が法人税の合計と必ず1円単位で一致するようにする。
+     赤字の社員には税を負担させない(その損失は会社全体の通算で既に効いている)。
+
+   ■ 分配対象額 = 投資収益 − 年間報酬 − 会社負担経費 − 按分後の法人税
+     会社負担経費(社会保険料の会社負担分など)は報酬と同じ性質のコストなので、
+     50/50に分ける前に差し引く。結果として社員と会社が実質半分ずつ負担する。
+     一方「インセンティブから控除」の経費はすでに incentive_ledger 側で
+     社員の残高から全額引かれているため、ここで引くと二重に差し引かれてしまう。
+     課税ベースの計算では両方の経費を引く(どちらも会社が支払った損金のため)。
 --------------------------------------------------------------------- */
-async function saveAnnualSettlement(fields){
-  const { data:{ user } } = await sb.auth.getUser();
+/* ---------------------------------------------------------------------
+   稼働月数の計算
+   ---------------------------------------------------------------------
+   社員ごとに「稼働開始月」「稼働終了月」を持ち、報酬コストは
+   月額 × その期間に実際に稼働していた月数 で計算する。
+   開始月・終了月はどちらもその月を含む(入社した月から数える)。
+   未設定の場合は期間全体を稼働扱いにするため、従来どおり満額になる。
+--------------------------------------------------------------------- */
+function monthSerial(dateStr){            // 'YYYY-MM' / 'YYYY-MM-DD' → 年*12+月
+  if(!dateStr) return null;
+  const y = Number(String(dateStr).slice(0,4));
+  const m = Number(String(dateStr).slice(5,7));
+  if(!y || !m) return null;
+  return y * 12 + m;
+}
+function serialToYm(serial){              // 年*12+月 → 'YYYY-MM'
+  const y = Math.floor((serial - 1) / 12);
+  return `${y}-${String(serial - y*12).padStart(2,'0')}`;
+}
+function activeMonthsInPeriod(emp, periodStart, periodEnd){
+  const from0 = monthSerial(periodStart);
+  const to0   = monthSerial(periodEnd);
+  if(from0 === null || to0 === null) return 0;
+  const s = monthSerial(emp && emp.started_on);
+  const e = monthSerial(emp && emp.ended_on);
+  const from = (s !== null) ? Math.max(from0, s) : from0;
+  const to   = (e !== null) ? Math.min(to0,   e) : to0;
+  return Math.max(0, to - from + 1);
+}
 
-  const investmentProfit = fields.investmentProfit;
-  const salaryCost = fields.salaryCost;
-  const taxActive = fields.taxActive;
-  const taxRate = fields.taxRate;
-  const taxCost = (taxActive && investmentProfit > 0) ? investmentProfit * taxRate : 0;
-  const distributable = investmentProfit - salaryCost - taxCost;
-  const splitRate = fields.splitRate;
-  const employeeAmount = distributable >= 0 ? distributable * splitRate : distributable;  // マイナスは全額社員負担
-  const companyShare = distributable >= 0 ? (distributable - employeeAmount) : 0;
+function annualExpenseTotalFor(employeeId, fiscalYearEnd, fundedBy){
+  return (state.adminAnnualExpenses||[])
+    .filter(e => e.employee_id === employeeId && e.fiscal_year_end === fiscalYearEnd
+                 && (!fundedBy || e.funded_by === fundedBy))
+    .reduce((s,e) => s + Number(e.amount||0), 0);
+}
 
-  const { data: settlement, error } = await sb.from('annual_settlements').upsert({
-    employee_id: fields.employeeId,
-    company_id: state.adminCompanyId,
-    fiscal_year_start: fields.start,
-    fiscal_year_end: fields.end,
-    investment_profit: investmentProfit,
-    salary_cost: salaryCost,
-    company_tax_active: taxActive,
-    tax_rate_used: taxActive ? taxRate : 0,
-    tax_cost: taxCost,
-    distributable,
-    split_rate: splitRate,
-    employee_settlement_amount: employeeAmount,
-    company_share: companyShare,
-    created_by: user.id
-  }, { onConflict: 'employee_id,fiscal_year_end' }).select().single();
+function computeYearSettlement(f){
+  const employees = state.adminEmployees || [];
+  const taxRate = Number(f.taxRate)||0;
+  const splitRate = Number(f.splitRate)||0;
 
-  if(error){ alert('精算の保存に失敗しました: '+error.message); return; }
-
-  await sb.from('incentive_ledger').insert({
-    employee_id: fields.employeeId,
-    entry_type: 'annual_settlement',
-    amount: employeeAmount,
-    status: 'completed',
-    related_settlement_id: settlement.id,
-    note: `${fields.start} 〜 ${fields.end} の年次精算`
+  // 期首残高 = 年度開始日の前日(=前年度末)時点の残高
+  const rows = employees.map(emp => {
+    const profit = employeeInvestmentProfit(emp.id, addDaysStr(f.start,-1), f.end);
+    const activeMonths = activeMonthsInPeriod(emp, f.start, f.end);              // 稼働していた月数
+    const salaryCost = Number(emp.monthly_salary||0) * activeMonths;
+    const expenseCost        = annualExpenseTotalFor(emp.id, f.end);              // 課税ベース用(全額)
+    const companyExpenseCost = annualExpenseTotalFor(emp.id, f.end, 'company');   // 分配前に引く分
+    return { emp, profit, activeMonths, salaryCost, expenseCost, companyExpenseCost,
+             taxBase: profit - salaryCost - expenseCost };
   });
 
+  const companyTaxBase = rows.reduce((s,r) => s + r.taxBase, 0);
+  const lossAvailable  = Math.max(0, Number(f.lossAvailable)||0);
+  const lossUsed       = Math.min(Math.max(0, companyTaxBase), lossAvailable);
+  const taxableIncome  = Math.max(0, companyTaxBase - lossUsed);
+  const totalTax       = Math.round(taxableIncome * taxRate);
+  const taxableRatio   = companyTaxBase > 0 ? (taxableIncome / companyTaxBase) : 0;
+
+  // 法人税の合計を黒字社員の課税ベース比率で按分(端数は最後の黒字社員に寄せる)
+  const positiveRows = rows.filter(r => r.taxBase > 0);
+  const positiveBaseTotal = positiveRows.reduce((s,r) => s + r.taxBase, 0);
+  rows.forEach(r => { r.taxCost = 0; });
+  let allocated = 0;
+  positiveRows.forEach((r, i) => {
+    if(positiveBaseTotal <= 0) return;
+    const isLast = (i === positiveRows.length - 1);
+    r.taxCost = isLast ? (totalTax - allocated) : Math.round(totalTax * (r.taxBase / positiveBaseTotal));
+    allocated += r.taxCost;
+  });
+
+  rows.forEach(r => {
+    // 円未満が残らないよう、社員取り分を丸めてから会社取り分を差額で出す
+    // (こうしないと 社員取り分 + 会社取り分 が分配対象額と1円ずれることがある)
+    r.distributable   = Math.round(r.profit - r.salaryCost - r.companyExpenseCost - r.taxCost);
+    r.employeeAmount  = r.distributable >= 0 ? Math.round(r.distributable * splitRate) : r.distributable; // マイナスは全額社員負担
+    r.companyShare    = r.distributable >= 0 ? (r.distributable - r.employeeAmount) : 0;
+    r.already         = (state.adminSettlements||[]).find(s => s.employee_id === r.emp.id && s.fiscal_year_end === f.end) || null;
+  });
+
+  return { rows, companyTaxBase, lossAvailable, lossUsed, taxableIncome, taxableRatio, totalTax, taxRate, splitRate };
+}
+
+/* ---------------------------------------------------------------------
+   今期の見込み(未確定)を会社全体で計算する ─ 管理者画面用
+   ---------------------------------------------------------------------
+   社員ごとの estimateCurrentSettlement() に、まだ精算していない年度の経費と
+   法人税の按分を上乗せしたもの。税額の出し方は確定時と同じ考え方で、
+   繰越欠損金は「繰越欠損金」タブの現在の登録残高を使う。
+   ※ 社員画面の見込みは会社全体のデータを持たないため、従来どおり税抜きのまま。
+--------------------------------------------------------------------- */
+function estimateCurrentSettlementAll(splitRate){
+  splitRate = splitRate ?? 0.5;
+  const taxRate = Number(state.settlementForm?.taxRate) || 0.30;
+  const lossAvailable = (state.adminLoss||[]).reduce((s,l)=> s + Number(l.remaining_amount||0), 0);
+
+  const rows = (state.adminEmployees||[]).map(emp => {
+    const accounts    = (state.adminAccounts||[]).filter(a => a.employee_id === emp.id);
+    const settlements = (state.adminSettlements||[]).filter(s => s.employee_id === emp.id);
+    const est = estimateCurrentSettlement(accounts, state.adminBalances||{}, state.adminCashflows||{},
+                                          emp.monthly_salary, settlements, splitRate, emp);
+    if(!est) return { emp, est: null, expenseCost: 0, companyExpenseCost: 0, taxBase: 0, taxCost: 0 };
+    // まだ精算していない年度(= 見込み期間の開始日より後に期末を迎える年度)の経費
+    const unsettled = (state.adminAnnualExpenses||[])
+      .filter(e => e.employee_id === emp.id && String(e.fiscal_year_end) > est.startDate);
+    const expenseCost        = unsettled.reduce((s,e) => s + Number(e.amount||0), 0);
+    const companyExpenseCost = unsettled.filter(e => e.funded_by === 'company')
+                                        .reduce((s,e) => s + Number(e.amount||0), 0);
+    return { emp, est, expenseCost, companyExpenseCost,
+             taxBase: est.profit - est.salaryCost - expenseCost, taxCost: 0 };
+  });
+
+  const active = rows.filter(r => r.est);
+  const companyTaxBase = active.reduce((s,r) => s + r.taxBase, 0);
+  const lossUsed       = Math.min(Math.max(0, companyTaxBase), lossAvailable);
+  const taxableIncome  = Math.max(0, companyTaxBase - lossUsed);
+  const totalTax       = Math.round(taxableIncome * taxRate);
+
+  const positiveRows = active.filter(r => r.taxBase > 0);
+  const positiveBaseTotal = positiveRows.reduce((s,r) => s + r.taxBase, 0);
+  let allocated = 0;
+  positiveRows.forEach((r, i) => {
+    if(positiveBaseTotal <= 0) return;
+    const isLast = (i === positiveRows.length - 1);
+    r.taxCost = isLast ? (totalTax - allocated) : Math.round(totalTax * (r.taxBase / positiveBaseTotal));
+    allocated += r.taxCost;
+  });
+
+  active.forEach(r => {
+    r.distributable  = Math.round(r.est.profit - r.est.salaryCost - r.companyExpenseCost - r.taxCost);
+    r.employeeAmount = r.distributable >= 0 ? Math.round(r.distributable * splitRate) : r.distributable;
+    r.companyShare   = r.distributable >= 0 ? (r.distributable - r.employeeAmount) : 0;
+  });
+
+  return { rows, companyTaxBase, lossAvailable, lossUsed, taxableIncome, totalTax, taxRate };
+}
+
+/* ---------------------------------------------------------------------
+   年次精算の確定(年度単位で全社員をまとめて保存)
+   繰越欠損金は会社単位で消し込むため、社員ごとに確定すると二重に減ってしまう。
+   そのため確定は年度単位の一括処理にしている。
+--------------------------------------------------------------------- */
+async function confirmYearSettlement(){
+  const f = state.settlementForm;
+  if(!f) return;
+  const calc = computeYearSettlement(f);
+  const targets = calc.rows.filter(r => !r.already);
+  if(!targets.length){ alert('この年度は全社員すでに記録済みです。'); return; }
+
+  const ok = confirm(
+    `${f.start} 〜 ${f.end} の年次精算を確定します。\n\n` +
+    `対象社員: ${targets.map(r=>r.emp.name).join('、')}\n` +
+    `会社の課税ベース合計: ${yen(Math.round(calc.companyTaxBase))}\n` +
+    `繰越欠損金の充当額: ${yen(Math.round(calc.lossUsed))}\n` +
+    `課税対象額: ${yen(Math.round(calc.taxableIncome))}\n` +
+    `法人税の合計: ${yen(calc.totalTax)}\n\n` +
+    `繰越欠損金は発生年度の古いものから自動で消し込まれます。よろしいですか？`
+  );
+  if(!ok) return;
+
+  const { data:{ user } } = await sb.auth.getUser();
+
+  for(const r of targets){
+    const { data: settlement, error } = await sb.from('annual_settlements').upsert({
+      employee_id: r.emp.id,
+      company_id: state.adminCompanyId,
+      fiscal_year_start: f.start,
+      fiscal_year_end: f.end,
+      investment_profit: r.profit,
+      salary_cost: r.salaryCost,
+      expense_cost: r.expenseCost,
+      company_expense_cost: r.companyExpenseCost,
+      tax_base: r.taxBase,
+      company_tax_base: calc.companyTaxBase,
+      loss_used_total: calc.lossUsed,
+      taxable_ratio: calc.taxableRatio,
+      company_tax_active: calc.totalTax > 0,
+      tax_rate_used: calc.taxRate,
+      tax_cost: r.taxCost,
+      distributable: r.distributable,
+      split_rate: calc.splitRate,
+      employee_settlement_amount: r.employeeAmount,
+      company_share: r.companyShare,
+      created_by: user.id
+    }, { onConflict: 'employee_id,fiscal_year_end' }).select().single();
+
+    if(error){ alert(`${r.emp.name} の精算保存に失敗しました: ${error.message}`); return; }
+
+    await sb.from('incentive_ledger').insert({
+      employee_id: r.emp.id,
+      entry_type: 'annual_settlement',
+      amount: r.employeeAmount,
+      status: 'completed',
+      related_settlement_id: settlement.id,
+      note: `${f.start} 〜 ${f.end} の年次精算`
+    });
+  }
+
+  await consumeLossCarryforward(calc.lossUsed, f.end);
   loadAdminData();
+}
+
+/* 繰越欠損金を発生年度の古いものから順に消し込む(先入先出) */
+async function consumeLossCarryforward(amount, fiscalYearEnd){
+  let remaining = Math.round(Number(amount)||0);
+  if(remaining <= 0) return;
+
+  const vintages = (state.adminLoss||[])
+    .filter(l => Number(l.remaining_amount||0) > 0)
+    .slice()
+    .sort((a,b) => String(a.fiscal_year_end).localeCompare(String(b.fiscal_year_end))); // 古い年度から
+
+  for(const v of vintages){
+    if(remaining <= 0) break;
+    const avail = Number(v.remaining_amount||0);
+    const use = Math.min(avail, remaining);
+
+    const { error } = await sb.from('loss_carryforward_vintages').update({
+      used_amount: Number(v.used_amount||0) + use,
+      remaining_amount: avail - use
+    }).eq('id', v.id);
+    if(error){ alert('繰越欠損金の更新に失敗しました: '+error.message); return; }
+
+    await sb.from('loss_carryforward_usages').insert({
+      company_id: state.adminCompanyId,
+      vintage_id: v.id,
+      fiscal_year_end: fiscalYearEnd,
+      amount: use
+    });
+
+    remaining -= use;
+  }
+
+  if(remaining > 0){
+    alert(`繰越欠損金の登録残高が不足していたため、${yen(remaining)} 分は消し込めませんでした。「繰越欠損金」タブの登録内容を確認してください。`);
+  }
 }
 
 /* =====================================================================
@@ -1002,7 +1255,10 @@ function renderEmpNamePick(){
 }
 
 function renderPinScreen(kind){
-  const title = kind === 'employee' ? '社員用PINを入力' : '管理者用PINを入力';
+  const title = kind === 'employee' ? 'あなたのPINを入力' : '管理者用PINを入力';
+  const sub = kind === 'employee'
+    ? '自分に割り当てられたPINを入力してください。分からない場合は管理者に確認してください。'
+    : '管理者用のPINを入力してください。';
   const back = kind === 'employee' ? `goEmployeePick()` : `goGate()`;
   const submit = kind === 'employee' ? `submitEmployeePin(document.getElementById('pin-input').value)` : `submitAdminPin(document.getElementById('pin-input').value)`;
   app.innerHTML = `
@@ -1010,7 +1266,7 @@ function renderPinScreen(kind){
     <div class="gate-card">
       <div class="back-link" onclick="${back}">← 戻る</div>
       <div class="gate-title">${title}</div>
-      <div class="gate-sub">チームで共有しているPINを入力してください。</div>
+      <div class="gate-sub">${sub}</div>
       <div class="field-group">
         <input id="pin-input" type="password" inputmode="numeric" placeholder="PIN" autofocus
           onkeydown="if(event.key==='Enter'){${submit}}" />
@@ -1089,7 +1345,7 @@ function renderEmployeeDashboard(){
 
   const estimate = estimateCurrentSettlement(
     state.myAccounts||[], state.myBalances||{}, state.myCashflows||{},
-    state.mySalary||0, state.mySettlements||[], 0.5
+    state.mySalary||0, state.mySettlements||[], 0.5, state.currentEmployee
   );
   const estimateHtml = estimate ? `
         <div class="row" style="margin-top:16px;padding-top:16px;border-top:1px dashed var(--border);">
@@ -1097,7 +1353,7 @@ function renderEmployeeDashboard(){
           <div class="stat"><div class="label">固定給コスト(${estimate.months}ヶ月分)</div><div class="value">${yen(estimate.salaryCost)}</div></div>
           <div class="stat"><div class="label">見込みインセンティブ(折半後)</div><div class="value ${estimate.employeeAmount<0?'negative':'positive'}">${yen(Math.round(estimate.employeeAmount))}</div></div>
         </div>
-        <div class="desc" style="margin-top:10px;">※ 見込みは残高・入出金の入力に応じて自動計算される暫定値です(法人税は未確定のため含まれません)。決算締めの年次精算で確定するまで残高には加算されません。</div>` : '';
+        <div class="desc" style="margin-top:10px;">※ 見込みは残高・入出金の入力に応じて自動計算される暫定値です。<strong>法人税は含まれていません</strong>(会社全体の利益と繰越欠損金が決まらないと確定しないため)。繰越欠損金を使い切った年度は、確定額がこの見込みより少なくなります。決算締めの年次精算で確定するまで残高には加算されません。</div>` : '';
 
   const typeLabel = { annual_settlement:'年次精算', withdrawal:'引き出し', expense_payment:'経費充当' };
   const statusLabel = { pending:'申請中', completed:'完了', rejected:'取消' };
@@ -1152,6 +1408,16 @@ function renderEmployeeDashboard(){
         </div>
       </div>
       ${annualExpHtml}
+      <div class="card">
+        <h2>ログインPINの変更</h2>
+        <div class="desc">4〜6桁の数字で設定してください。自分専用のPINなので、他の人には教えないでください。</div>
+        <div class="form-inline">
+          <div><label>現在のPIN</label><input type="password" inputmode="numeric" maxlength="6" id="pin-cur" /></div>
+          <div><label>新しいPIN</label><input type="password" inputmode="numeric" maxlength="6" id="pin-new" /></div>
+          <div><label>新しいPIN(確認)</label><input type="password" inputmode="numeric" maxlength="6" id="pin-new2" /></div>
+          <button class="btn-accent" onclick="changeMyPin()">変更する</button>
+        </div>
+      </div>
     </div>
   `;
 
@@ -1264,8 +1530,12 @@ function adminAccountsHtml(){
   const empRows = (state.adminEmployees||[]).map(emp => `<tr>
     <td>${emp.name}</td>
     <td class="num">${yen(emp.monthly_salary)}</td>
+    <td><input type="month" value="${emp.started_on ? String(emp.started_on).slice(0,7) : ''}"
+               onchange="updateEmployeeMonth('${emp.id}','started_on',this.value)" /></td>
+    <td><input type="month" value="${emp.ended_on ? String(emp.ended_on).slice(0,7) : ''}"
+               onchange="updateEmployeeMonth('${emp.id}','ended_on',this.value)" /></td>
     <td><button class="row-delete" onclick="deleteEmployee('${emp.id}','${emp.name}')">削除</button></td>
-  </tr>`).join('') || `<tr><td colspan="3" class="empty">社員が登録されていません</td></tr>`;
+  </tr>`).join('') || `<tr><td colspan="5" class="empty">社員が登録されていません</td></tr>`;
 
   return `
   <div class="card">
@@ -1283,17 +1553,70 @@ function adminAccountsHtml(){
   </div>
   <div class="card">
     <h2>社員一覧・登録</h2>
+    <div class="desc">年次精算の報酬コストは「月額 × 稼働していた月数」で計算します。稼働開始月・稼働終了月はどちらもその月を含みます。<strong>空欄のままだと期間全体を稼働扱い(月額×12)にする</strong>ので、途中から稼働している社員は必ず稼働開始月を入れてください。</div>
     <table>
-      <thead><tr><th>氏名</th><th class="num">月給</th><th></th></tr></thead>
+      <thead><tr><th>氏名</th><th class="num">月額</th><th>稼働開始月</th><th>稼働終了月</th><th></th></tr></thead>
       <tbody>${empRows}</tbody>
     </table>
     <div class="form-inline">
       <div><label>氏名</label><input type="text" id="new-emp-name" placeholder="例: 佐藤 花子" /></div>
-      <div><label>月給</label><input type="number" id="new-emp-salary" placeholder="例: 300000" /></div>
-      <button class="btn-accent" onclick="addEmployee(document.getElementById('new-emp-name').value, Number(document.getElementById('new-emp-salary').value)||0)">社員を追加</button>
+      <div><label>月額</label><input type="number" id="new-emp-salary" placeholder="例: 300000" /></div>
+      <div><label>稼働開始月(任意)</label><input type="month" id="new-emp-started" /></div>
+      <button class="btn-accent" onclick="addEmployee(document.getElementById('new-emp-name').value, Number(document.getElementById('new-emp-salary').value)||0, document.getElementById('new-emp-started').value)">社員を追加</button>
     </div>
   </div>
+  ${adminEmployeePinHtml()}
   ${adminCashflowSectionHtml()}`;
+}
+
+/* ---------------------------------------------------------------------
+   社員のログインPIN(管理者用)
+   ---------------------------------------------------------------------
+   PINは社員ごとに持ち、ハッシュ化して保存しているため後から確認はできない。
+   忘れた場合はここで再設定する。
+   pin_updated_at が未設定の社員は、移行時にコピーした旧・共通PINのままなので
+   他の社員になりすまされる状態。警告を出して変更を促す。
+--------------------------------------------------------------------- */
+function adminEmployeePinHtml(){
+  const rows = (state.adminEmployees||[]).map(emp => {
+    const locked = emp.pin_locked_until && new Date(emp.pin_locked_until) > new Date();
+    const status = !emp.pin_hash
+      ? `<span style="color:var(--negative)">PIN未設定(ログインできません)</span>`
+      : !emp.pin_updated_at
+        ? `<span style="color:var(--warn)">⚠︎ 初期PINのまま(要変更)</span>`
+        : `<span class="muted">設定済み ${new Date(emp.pin_updated_at).toLocaleDateString('ja-JP')}</span>`;
+    return `<tr>
+      <td>${emp.name}</td>
+      <td>${status}${locked?' <span style="color:var(--negative)">／ロック中</span>':''}</td>
+      <td><input type="password" inputmode="numeric" maxlength="6" style="max-width:130px"
+                 id="setpin-${emp.id}" placeholder="4〜6桁の数字" /></td>
+      <td><button class="btn-accent" onclick="adminSetEmployeePin('${emp.id}','${emp.name}')">設定する</button></td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="4" class="empty">社員が登録されていません</td></tr>`;
+
+  const needChange = (state.adminEmployees||[]).filter(e => e.pin_hash && !e.pin_updated_at).length;
+
+  return `
+  <div class="card">
+    <h2>社員のログインPIN</h2>
+    <div class="desc">社員ごとにPINを設定します。設定したPINは本人にだけ伝えてください。PINは暗号化して保存するため、あとから確認することはできません。忘れた場合はここで再設定します。${needChange>0?`<br><strong style="color:var(--warn)">⚠︎ ${needChange}名が移行時の初期PIN(旧・共通PIN)のままです。この状態では他の社員になりすましてログインできてしまうため、早めに変更してください。</strong>`:''}</div>
+    <table>
+      <thead><tr><th>社員</th><th>状態</th><th>新しいPIN</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
+async function adminSetEmployeePin(employeeId, name){
+  const el = document.getElementById('setpin-' + employeeId);
+  const pin = (el?.value || '').trim();
+  if(!/^[0-9]{4,6}$/.test(pin)){ alert('PINは4〜6桁の数字で入力してください'); return; }
+  if(!confirm(`${name} さんのログインPINを設定します。よろしいですか？`)) return;
+  const { error } = await sb.rpc('set_employee_pin', { target_employee_id: employeeId, new_pin: pin });
+  if(error){ alert('設定に失敗しました: ' + error.message); return; }
+  if(el) el.value = '';
+  alert(`${name} さんのPINを設定しました。本人にだけ伝えてください。`);
+  loadAdminData();
 }
 
 function adminCashflowSectionHtml(){
@@ -1531,29 +1854,29 @@ function drawAccountCharts(ctx){
 }
 
 function adminCostHtml(){
-  const approvedByEmployee = {};
+  const companyExpByEmployee = {};
   (state.adminAnnualExpenses||[]).filter(e=>e.funded_by==='company').forEach(e=>{
-    approvedByEmployee[e.employee_id] = (approvedByEmployee[e.employee_id]||0) + Number(e.amount);
+    companyExpByEmployee[e.employee_id] = (companyExpByEmployee[e.employee_id]||0) + Number(e.amount);
   });
   const rows = (state.adminEmployees||[]).map(emp => {
-    const expCost = approvedByEmployee[emp.id] || 0;
-    const total = Number(emp.monthly_salary) + expCost;
+    const expCost = companyExpByEmployee[emp.id] || 0;
     const incBalance = incentiveBalance(employeeIncentiveLedger(emp.id));
+    const period = `${emp.started_on ? String(emp.started_on).slice(0,7) : '(開始月 未設定)'} 〜 ${emp.ended_on ? String(emp.ended_on).slice(0,7) : ''}`;
     return `<tr>
       <td>${emp.name}</td>
       <td class="num">${yen(emp.monthly_salary)}</td>
+      <td class="${emp.started_on?'muted':''}" style="${emp.started_on?'':'color:var(--warn)'}">${period}</td>
       <td class="num">${yen(expCost)}</td>
-      <td class="num"><strong>${yen(total)}</strong></td>
       <td class="num" style="color:${incBalance<0?'var(--negative)':'inherit'}">${yen(incBalance)}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="5" class="empty">社員が登録されていません</td></tr>`;
 
   return `
   <div class="card">
-    <h2>社員コスト(月給 + 会社負担の年度経費)</h2>
-    <div class="desc">「経費(年次)」タブで会社負担として登録した経費のみ集計しています(インセンティブから控除した分は含みません)。</div>
+    <h2>社員コスト</h2>
+    <div class="desc">年次精算では「月額 × その年度に稼働していた月数」を報酬コストとして分配対象額から差し引きます。会社負担の年度経費も同じく分配前に差し引かれます(インセンティブから控除した分は社員の残高から引かれるため、ここには含めていません)。稼働開始月・終了月は「口座残高・入出金」タブの社員一覧で設定できます。</div>
     <table>
-      <thead><tr><th>社員</th><th class="num">月給</th><th class="num">会社負担経費(累計)</th><th class="num">コスト計</th><th class="num">インセンティブ残高</th></tr></thead>
+      <thead><tr><th>社員</th><th class="num">月額</th><th>稼働期間</th><th class="num">会社負担経費(累計)</th><th class="num">インセンティブ残高</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
   </div>`;
@@ -1561,7 +1884,7 @@ function adminCostHtml(){
 
 function adminExpensesHtml(){
   const employeesById = Object.fromEntries((state.adminEmployees||[]).map(e=>[e.id,e.name]));
-  const fundedLabel = { company:'会社負担', incentive:'インセンティブから控除' };
+  const fundedLabel = { company:'会社負担(分配前に控除)', incentive:'インセンティブから控除' };
   const rows = (state.adminAnnualExpenses||[]).map(e => `<tr>
     <td>${employeesById[e.employee_id]||'—'}</td>
     <td>〜${e.fiscal_year_end}</td>
@@ -1580,7 +1903,7 @@ function adminExpensesHtml(){
   return `
   <div class="card">
     <h2>経費(年度合計)</h2>
-    <div class="desc">社員ごとに年度の経費合計額を登録します。「インセンティブから控除」を選ぶと、その社員のインセンティブ残高から自動的に差し引かれます(会社負担を選ぶと社員コストタブに集計されます)。</div>
+    <div class="desc">社員ごとに年度の経費合計額を登録します。<strong>会社負担</strong>(社会保険料の会社負担分など)を選ぶと、年次精算で利益を折半する<strong>前</strong>に分配対象額から差し引かれるため、社員と会社が実質半分ずつ負担します。<strong>インセンティブから控除</strong>を選ぶと、その社員のインセンティブ残高から全額が即座に差し引かれます。</div>
     <table>
       <thead><tr><th>社員</th><th>年度</th><th class="num">合計額</th><th>負担</th><th>メモ</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
@@ -1591,8 +1914,8 @@ function adminExpensesHtml(){
       <div><label>合計額</label><input type="number" id="ae-amount" placeholder="例: 500000" /></div>
       <div><label>負担</label>
         <select id="ae-funded">
-          <option value="incentive">インセンティブから控除</option>
-          <option value="company">会社負担</option>
+          <option value="incentive">インセンティブから控除(社員が全額)</option>
+          <option value="company">会社負担(分配前に控除・実質折半)</option>
         </select>
       </div>
       <div><label>メモ(任意)</label><input type="text" id="ae-note" /></div>
@@ -1650,22 +1973,64 @@ async function deleteAnnualExpense(id){
 
 function adminIncentiveHtml(){
   const employeesById = Object.fromEntries((state.adminEmployees||[]).map(e=>[e.id,e.name]));
+  const estAll = estimateCurrentSettlementAll(0.5);
+  const ret    = computeRetainedSummary();
+  const retById = Object.fromEntries(ret.perEmployee.map(r => [r.emp.id, r]));
 
-  const summaryRows = (state.adminEmployees||[]).map(emp => {
-    const ledger = employeeIncentiveLedger(emp.id);
-    const balance = incentiveBalance(ledger);
-    const pending = incentivePendingWithdrawals(ledger);
-    const empAccounts = (state.adminAccounts||[]).filter(a=>a.employee_id===emp.id);
-    const empSettlements = (state.adminSettlements||[]).filter(s=>s.employee_id===emp.id);
-    const est = estimateCurrentSettlement(empAccounts, state.adminBalances||{}, state.adminCashflows||{}, emp.monthly_salary, empSettlements, 0.5);
+  const balanceOf = id => incentiveBalance(employeeIncentiveLedger(id));
+  const totalBalance  = (state.adminEmployees||[]).reduce((s,e) => s + balanceOf(e.id), 0);
+  const hasEstimate   = estAll.rows.some(r => r.est);
+  const totalEstimate = estAll.rows.filter(r => r.est).reduce((s,r) => s + Number(r.employeeAmount||0), 0);
+
+  /* ---- 1. 社員の残高と会社の取り分(先頭に会社全体の行) ---- */
+  const summaryTotalRow = `<tr class="total-row">
+    <td>会社全体</td>
+    <td class="num" style="color:${totalBalance<0?'var(--negative)':'inherit'}">${yen(Math.round(totalBalance))}</td>
+    <td class="num">${yen(Math.round(ret.totals.share))}</td>
+    <td class="num">${hasEstimate?yen(Math.round(totalEstimate)):'—'}</td>
+  </tr>`;
+
+  const summaryRows = estAll.rows.map(r => {
+    const balance = balanceOf(r.emp.id);
+    const share   = retById[r.emp.id] ? retById[r.emp.id].share : 0;
     return `<tr>
-      <td>${emp.name}</td>
-      <td class="num" style="color:${balance<0?'var(--negative)':'inherit'}"><strong>${yen(balance)}</strong></td>
-      <td class="num">${pending>0?yen(pending):'—'}</td>
-      <td class="num" style="color:${est&&est.employeeAmount<0?'var(--negative)':'var(--muted)'}">${est?yen(Math.round(est.employeeAmount)):'—'}</td>
+      <td>${r.emp.name}</td>
+      <td class="num" style="color:${balance<0?'var(--negative)':'inherit'}"><strong>${yen(Math.round(balance))}</strong></td>
+      <td class="num">${yen(Math.round(share))}</td>
+      <td class="num" style="color:${r.est&&r.employeeAmount<0?'var(--negative)':'var(--muted)'}">${r.est?yen(r.employeeAmount):'—'}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="4" class="empty">社員が登録されていません</td></tr>`;
 
+  /* ---- 2. 社員ごとの内訳(確定分の累計) ---- */
+  const empTotalRow = `<tr class="total-row">
+    <td>会社全体</td>
+    <td class="num">—</td>
+    <td class="num">${yen(Math.round(ret.totals.profit))}</td>
+    <td class="num">${yen(Math.round(ret.totals.reward))}</td>
+    <td class="num">${yen(Math.round(ret.totals.cexp))}</td>
+    <td class="num">${yen(Math.round(ret.totals.tax))}</td>
+    <td class="num">${yen(Math.round(ret.totals.share))}</td>
+  </tr>`;
+
+  const empRows = ret.perEmployee.map(r => `<tr>
+    <td>${r.emp.name}</td>
+    <td class="num muted">${r.years}年度分</td>
+    <td class="num">${yen(Math.round(r.profit))}</td>
+    <td class="num">${yen(Math.round(r.reward))}</td>
+    <td class="num">${yen(Math.round(r.cexp))}</td>
+    <td class="num">${yen(Math.round(r.tax))}</td>
+    <td class="num"><strong style="color:${r.share<0?'var(--negative)':'inherit'}">${yen(Math.round(r.share))}</strong></td>
+  </tr>`).join('') || `<tr><td colspan="7" class="empty">確定した年次精算がまだありません</td></tr>`;
+
+  /* ---- 3. 年度ごとの推移(表示は新しい順) ---- */
+  const yearRows = ret.yearData.slice().reverse().map(d => `<tr>
+    <td>〜${d.y}</td>
+    <td class="num">${yen(Math.round(d.cexp))}</td>
+    <td class="num" style="color:${d.share<0?'var(--negative)':'inherit'}">${yen(Math.round(d.share))}</td>
+    <td class="num"><strong>${yen(Math.round(d.cumulative))}</strong></td>
+  </tr>`).join('') || `<tr><td colspan="4" class="empty">まだ記録がありません</td></tr>`;
+
+  /* ---- 4. 引き出し申請 ---- */
   const pendingWithdrawals = (state.adminIncentiveLedger||[]).filter(e=>e.entry_type==='withdrawal' && e.status==='pending');
   const pendingRows = pendingWithdrawals.map(w => `<tr>
     <td>${employeesById[w.employee_id]||'—'}</td>
@@ -1678,6 +2043,7 @@ function adminIncentiveHtml(){
     </td>
   </tr>`).join('') || `<tr><td colspan="5" class="empty">引き出し申請中のものはありません</td></tr>`;
 
+  /* ---- 5. 履歴 ---- */
   const historyRows = (state.adminIncentiveLedger||[]).slice(0,40).map(e => {
     const typeLabel = { annual_settlement:'年次精算', withdrawal:'引き出し', expense_payment:'経費充当' }[e.entry_type] || e.entry_type;
     const statusLabel = { pending:'申請中', completed:'完了', rejected:'取消' }[e.status] || e.status;
@@ -1693,12 +2059,37 @@ function adminIncentiveHtml(){
 
   return `
   <div class="card">
-    <h2>インセンティブ残高</h2>
+    <h2>インセンティブと会社の取り分</h2>
+    <div class="desc">分配比率が50%のため、確定した時点では社員の取り分と会社の取り分は同額です。そこから差が開くのは、社員側がインセンティブから経費を充当したり引き出したりするためです。「今期の見込み」は最後に確定した精算の翌日から現在までの暫定値で、まだ精算していない年度の経費を課税ベースに含め、繰越欠損金の残高(${yen(Math.round(estAll.lossAvailable))})を差し引いた課税対象額に対する法人税${yen(estAll.totalTax)}を按分しています。</div>
     <table>
-      <thead><tr><th>社員</th><th class="num">現在の残高(確定分)</th><th class="num">引き出し申請中</th><th class="num">今期の見込み(未確定)</th></tr></thead>
-      <tbody>${summaryRows}</tbody>
+      <thead><tr><th>社員</th><th class="num">現在のインセンティブ残高</th><th class="num">会社取り分(累計)</th><th class="num">今期の見込み取り分</th></tr></thead>
+      <tbody>${summaryTotalRow}${summaryRows}</tbody>
     </table>
   </div>
+
+  <div class="card">
+    <h2>社員ごとの内訳(確定分の累計)</h2>
+    <div class="desc">会社取り分 = (投資収益 − 報酬 − 会社負担経費 − 法人税) の会社側50%分の累計です。会社負担経費は分配前に差し引いているため、この会社取り分がそのまま会社に残った額になります。「インセンティブから控除」を選んだ経費(累計 ${yen(Math.round(ret.totals.incentiveExpense))})は社員のインセンティブ残高から全額引かれるため、ここには含めていません。マイナスの年度は社員が全額を負担するルールのため、会社取り分は0として扱っています。</div>
+    <table>
+      <thead><tr>
+        <th>社員</th><th class="num">対象</th><th class="num">投資収益</th><th class="num">報酬</th>
+        <th class="num">会社負担経費</th><th class="num">法人税</th><th class="num">会社取り分</th>
+      </tr></thead>
+      <tbody>${empTotalRow}${empRows}</tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>年度ごとの推移(会社の利益蓄積)</h2>
+    <div class="desc">古い年度から順に積み上げた累計です。会社負担経費は会社取り分を出す前にすでに差し引かれています。</div>
+    <table>
+      <thead><tr>
+        <th>年度</th><th class="num">会社負担経費</th><th class="num">会社取り分</th><th class="num">累計</th>
+      </tr></thead>
+      <tbody>${yearRows}</tbody>
+    </table>
+  </div>
+
   <div class="card">
     <h2>引き出し申請</h2>
     <table>
@@ -1706,6 +2097,7 @@ function adminIncentiveHtml(){
       <tbody>${pendingRows}</tbody>
     </table>
   </div>
+
   <div class="card">
     <h2>履歴(直近40件)</h2>
     <table>
@@ -1748,9 +2140,9 @@ function adminSettlementHtml(){
       companyId: state.adminCompanyId,
       start: defaultYear.start,
       end: defaultYear.end,
-      taxActive: false,
       taxRate: 0.30,
       splitRate: 0.5,
+      lossOverride: null,  // null なら「繰越欠損金」タブの登録残高をそのまま使う
     };
   }
   const f = state.settlementForm;
@@ -1759,64 +2151,89 @@ function adminSettlementHtml(){
     `<option value="${y.start}|${y.end}" ${y.start===f.start?'selected':''}>${y.label}</option>`
   ).join('');
 
-  const remainingLoss = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
+  const registeredLoss = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
+  f.lossAvailable = (f.lossOverride === null || f.lossOverride === undefined) ? registeredLoss : f.lossOverride;
 
   const selectedYear = years.find(y=>y.start===f.start);
   const isCurrentYear = selectedYear?.isCurrent;
 
-  const rows = (state.adminEmployees||[]).map(emp => {
-    // 期首残高 = 年度開始日の前日(=前年度末)時点の残高
-    const profit = employeeInvestmentProfit(emp.id, addDaysStr(f.start,-1), f.end);
-    const annualSalary = Number(emp.monthly_salary) * 12;
-    const taxCost = (f.taxActive && profit > 0) ? profit * f.taxRate : 0;
-    const distributable = profit - annualSalary - taxCost;
-    const employeeAmount = distributable >= 0 ? distributable * f.splitRate : distributable;  // マイナスは全額社員負担
-    const companyShare = distributable >= 0 ? (distributable - employeeAmount) : 0;
-    const already = (state.adminSettlements||[]).find(s=>s.employee_id===emp.id && s.fiscal_year_end===f.end);
+  const calc = computeYearSettlement(f);
+  const allSettled = calc.rows.length > 0 && calc.rows.every(r => r.already);
+  const ratioPct = (calc.taxableRatio * 100).toFixed(1);
 
-    return `
+  // 課税状況の説明文
+  let taxNote;
+  if(calc.companyTaxBase <= 0){
+    taxNote = 'この年度は会社全体の課税ベースがマイナスのため、法人税は発生しません。';
+  } else if(calc.taxableIncome <= 0){
+    taxNote = `課税ベース ${yen(Math.round(calc.companyTaxBase))} は繰越欠損金で全額相殺できるため、法人税は発生しません。`;
+  } else if(calc.lossUsed > 0){
+    taxNote = `<strong>繰越欠損金を使い切る年度です。</strong>課税ベース ${yen(Math.round(calc.companyTaxBase))} のうち ${yen(Math.round(calc.lossUsed))} を欠損金で相殺し、残りの ${yen(Math.round(calc.taxableIncome))}(全体の ${ratioPct}%)だけが課税対象になります。法人税 ${yen(calc.totalTax)} は、各社員の課税ベースの比率でそのまま按分されます。`;
+  } else {
+    taxNote = '使える繰越欠損金がないため、課税ベースの全額が課税対象になります。';
+  }
+
+  const rows = calc.rows.map(r => `
     <div class="card">
-      <h3 style="margin-bottom:14px;">${emp.name}${already?' <span class="badge badge-approved">記録済み</span>':''}</h3>
+      <h3 style="margin-bottom:14px;">${r.emp.name}${r.already?' <span class="badge badge-approved">記録済み</span>':''}</h3>
       <div class="row">
-        <div class="stat"><div class="label">投資収益(入出金調整後)</div><div class="value ${profit<0?'negative':'positive'}">${yen(profit)}</div></div>
-        <div class="stat"><div class="label">固定給(年間)</div><div class="value">${yen(annualSalary)}</div></div>
-        <div class="stat"><div class="label">法人税相当額</div><div class="value">${yen(taxCost)}</div></div>
+        <div class="stat"><div class="label">投資収益(入出金調整後)</div><div class="value ${r.profit<0?'negative':'positive'}">${yen(Math.round(r.profit))}</div></div>
+        <div class="stat"><div class="label">報酬(${r.activeMonths}ヶ月分)</div><div class="value">${yen(Math.round(r.salaryCost))}</div></div>
+        <div class="stat"><div class="label">年度経費<span class="muted" style="font-size:12px;font-weight:400;">(うち会社負担 ${yen(Math.round(r.companyExpenseCost))})</span></div><div class="value">${yen(Math.round(r.expenseCost))}</div></div>
       </div>
       <div class="row" style="margin-top:14px;">
-        <div class="stat"><div class="label">分配対象額</div><div class="value ${distributable<0?'negative':'positive'}">${yen(distributable)}</div></div>
-        <div class="stat"><div class="label">社員取り分(インセンティブへ)</div><div class="value ${employeeAmount<0?'negative':'positive'}">${yen(employeeAmount)}</div></div>
-        <div class="stat"><div class="label">会社取り分</div><div class="value">${yen(companyShare)}</div></div>
+        <div class="stat"><div class="label">課税ベース(収益−報酬−経費)</div><div class="value ${r.taxBase<0?'negative':'positive'}">${yen(Math.round(r.taxBase))}</div></div>
+        <div class="stat"><div class="label">法人税相当額(按分)</div><div class="value">${yen(r.taxCost)}${(calc.totalTax>0 && r.taxBase>0)?`<span class="muted" style="font-size:12px;font-weight:400;"> / 全体の${((r.taxCost/calc.totalTax)*100).toFixed(1)}%</span>`:''}</div></div>
+        <div class="stat"><div class="label">分配対象額</div><div class="value ${r.distributable<0?'negative':'positive'}">${yen(Math.round(r.distributable))}</div></div>
       </div>
-      <div style="margin-top:16px;">
-        <button class="btn-accent" ${(already||isCurrentYear)?'disabled':''} onclick="saveAnnualSettlement({
-          employeeId:'${emp.id}', start:'${f.start}', end:'${f.end}',
-          investmentProfit:${profit}, salaryCost:${annualSalary},
-          taxActive:${f.taxActive}, taxRate:${f.taxRate}, splitRate:${f.splitRate}
-        })">${already?'この年度は記録済みです':(isCurrentYear?'進行中の年度は確定できません':'この内容で確定してインセンティブに反映')}</button>
+      <div class="row" style="margin-top:14px;">
+        <div class="stat"><div class="label">社員取り分(インセンティブへ)</div><div class="value ${r.employeeAmount<0?'negative':'positive'}">${yen(Math.round(r.employeeAmount))}</div></div>
+        <div class="stat"><div class="label">会社取り分</div><div class="value">${yen(Math.round(r.companyShare))}</div></div>
       </div>
-    </div>`;
-  }).join('') || `<div class="card"><p class="empty">社員が登録されていません</p></div>`;
+    </div>`
+  ).join('') || `<div class="card"><p class="empty">社員が登録されていません</p></div>`;
+
+  const btnLabel = allSettled ? 'この年度は記録済みです'
+                 : isCurrentYear ? '進行中の年度は確定できません'
+                 : 'この年度を確定してインセンティブに反映(全社員まとめて)';
 
   return `
   <div class="card">
     <h2>年次精算</h2>
-    <div class="desc">この会社の決算期: 毎年${fiscalStartMonth}月開始。現在の繰越欠損金残高合計: <strong>${yen(remainingLoss)}</strong>${remainingLoss<=0?' — 使い切っているため通常は法人税が発生します':' — 残っているため通常は法人税は発生しません'}</div>
+    <div class="desc">この会社の決算期: 毎年${fiscalStartMonth}月開始。法人税は会社全体の課税ベースで判定し、繰越欠損金を差し引いた残りの課税対象額に対する税額を、各社員の課税ベースの比率で按分します。</div>
     <div class="row">
       <div>
         <label>対象年度</label>
         <select onchange="const [s,e]=this.value.split('|'); state.settlementForm.start=s; state.settlementForm.end=e; renderAdminTabContent();">${yearOptions}</select>
       </div>
       <div>
-        <label>この年度、会社は法人税が発生する</label>
-        <select onchange="state.settlementForm.taxActive=(this.value==='yes'); renderAdminTabContent();">
-          <option value="no" ${!f.taxActive?'selected':''}>いいえ(繰越欠損金でまだ相殺できる)</option>
-          <option value="yes" ${f.taxActive?'selected':''}>はい(繰越欠損金を使い切った)</option>
-        </select>
+        <label>控除に使える繰越欠損金<span class="muted" style="font-weight:400;">(登録残高: ${yen(registeredLoss)})</span></label>
+        <input type="number" step="1" value="${Math.round(f.lossAvailable)}" onchange="state.settlementForm.lossOverride=Number(this.value); renderAdminTabContent();" />
       </div>
     </div>
     <div class="row" style="margin-top:10px;">
       <div><label>法人税率</label><input type="number" step="0.01" value="${f.taxRate}" onchange="state.settlementForm.taxRate=Number(this.value); renderAdminTabContent();" /></div>
       <div><label>分配比率(社員側)</label><input type="number" step="0.05" value="${f.splitRate}" onchange="state.settlementForm.splitRate=Number(this.value); renderAdminTabContent();" /></div>
+    </div>
+    ${f.lossOverride !== null && f.lossOverride !== undefined && f.lossOverride !== registeredLoss
+      ? `<div class="desc" style="margin-top:10px;">⚠︎ 繰越欠損金を手動で上書きしています。<a href="#" onclick="state.settlementForm.lossOverride=null; renderAdminTabContent(); return false;">登録残高(${yen(registeredLoss)})に戻す</a></div>` : ''}
+  </div>
+
+  <div class="card">
+    <h2>会社全体の税額計算</h2>
+    <div class="row">
+      <div class="stat"><div class="label">課税ベース合計(全社員通算)</div><div class="value ${calc.companyTaxBase<0?'negative':'positive'}">${yen(Math.round(calc.companyTaxBase))}</div></div>
+      <div class="stat"><div class="label">繰越欠損金の充当額</div><div class="value">${yen(Math.round(calc.lossUsed))}</div></div>
+      <div class="stat"><div class="label">課税対象額</div><div class="value">${yen(Math.round(calc.taxableIncome))}</div></div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <div class="stat"><div class="label">実効課税割合</div><div class="value">${ratioPct}%</div></div>
+      <div class="stat"><div class="label">法人税の合計(税率${(calc.taxRate*100).toFixed(0)}%)</div><div class="value">${yen(calc.totalTax)}</div></div>
+      <div class="stat"><div class="label">精算後の繰越欠損金残高</div><div class="value">${yen(Math.round(Math.max(0, registeredLoss - calc.lossUsed)))}</div></div>
+    </div>
+    <div class="desc" style="margin-top:12px;">${taxNote}</div>
+    <div style="margin-top:16px;">
+      <button class="btn-accent" ${(allSettled||isCurrentYear)?'disabled':''} onclick="confirmYearSettlement()">${btnLabel}</button>
     </div>
   </div>
   ${rows}`;
@@ -1832,9 +2249,11 @@ function addDaysStr(dateStr, days){
 function adminPLHtml(){
   const rows = (state.adminPL||[]).map(p => {
     const remainingLoss = (state.adminLoss||[]).reduce((s,l)=> s + Number(l.remaining_amount||0), 0);
-    const taxIfNoLoss = Math.max(0, Number(p.pretax_profit||0)) * Number(p.assumed_tax_rate||0);
-    const estimatedTaxNow = remainingLoss > 0 ? 0 : taxIfNoLoss;
-    const netAfterTaxEstimate = Number(p.pretax_profit||0) - estimatedTaxNow;
+    // 繰越欠損金は「使い切る年」に一部だけ課税されるため、按分ではなく残高を控除して計算する
+    const pretax = Number(p.pretax_profit||0);
+    const taxableAfterLoss = Math.max(0, pretax - remainingLoss);
+    const estimatedTaxNow = Math.round(taxableAfterLoss * Number(p.assumed_tax_rate||0));
+    const netAfterTaxEstimate = pretax - estimatedTaxNow;
     return `
     <div class="card">
       <div class="row">
@@ -1845,7 +2264,7 @@ function adminPLHtml(){
       <div class="row" style="margin-top:14px;">
         <div class="stat"><div class="label">当期の法人税等(実績)</div><div class="value">${yen(p.tax_amount)}</div></div>
         <div class="stat"><div class="label">当期純利益(実績)</div><div class="value">${yen(p.net_profit)}</div></div>
-        <div class="stat"><div class="label">繰越欠損金を使い切った場合の想定税引後利益</div><div class="value">${yen(netAfterTaxEstimate)}</div></div>
+        <div class="stat"><div class="label">繰越欠損金(残${yen(Math.round(remainingLoss))})を差し引いた想定税引後利益</div><div class="value">${yen(netAfterTaxEstimate)}</div></div>
       </div>
       ${p.notes ? `<div class="desc" style="margin-top:12px;">${p.notes}</div>` : ''}
       <div style="margin-top:14px;">
@@ -1917,6 +2336,13 @@ function adminLossHtml(){
 
   const total = (state.adminLoss||[]).reduce((s,l)=>s+Number(l.remaining_amount||0),0);
 
+  const vintageLabel = Object.fromEntries((state.adminLoss||[]).map(l=>[l.id, `${l.fiscal_year_start} 〜 ${l.fiscal_year_end}`]));
+  const usageRows = (state.adminLossUsages||[]).map(u => `<tr>
+      <td>〜${u.fiscal_year_end}</td>
+      <td>${vintageLabel[u.vintage_id] || '(削除済みの年度)'}</td>
+      <td class="num">${yen(u.amount)}</td>
+    </tr>`).join('') || `<tr><td colspan="3" class="empty">まだ消し込み履歴はありません</td></tr>`;
+
   return `
   <div class="card">
     <div class="stat"><div class="label">現在の繰越欠損金残高合計</div><div class="value" style="font-size:28px">${yen(total)}</div></div>
@@ -1926,6 +2352,14 @@ function adminLossHtml(){
     <table>
       <thead><tr><th>発生事業年度</th><th class="num">発生額</th><th class="num">控除済み累計</th><th class="num">繰越残額</th><th>失効期限</th><th>出典</th><th></th></tr></thead>
       <tbody>${rows}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <h2>消し込み履歴</h2>
+    <div class="desc">年次精算を確定したときに、発生年度の古いものから自動で消し込まれた記録です。</div>
+    <table>
+      <thead><tr><th>使った年度</th><th>充当した発生年度</th><th class="num">充当額</th></tr></thead>
+      <tbody>${usageRows}</tbody>
     </table>
   </div>
   <div class="card">
@@ -1948,6 +2382,65 @@ function adminLossHtml(){
       <button class="btn-accent" onclick="submitLossForm()">保存</button>
     </div>
   </div>`;
+}
+
+/* ---------------------------------------------------------------------
+   会社の利益蓄積の集計（インセンティブタブで表示）
+   ---------------------------------------------------------------------
+   蓄積額 = Σ会社取り分 − Σ会社負担経費
+
+   会社取り分は年次精算で確定した (投資収益 − 報酬 − 法人税) × (1 − 分配比率)。
+   分配比率が50%なので、確定時点では会社取り分と社員取り分は同額になる。
+   そこから差が開いていくのは、社員側が自分の経費をインセンティブから取り崩したり
+   引き出したりする一方、会社側は会社負担の経費を差し引くため。
+   マイナス年度は社員が全額を負担するルールのため、会社取り分は0(会社側は減らない)。
+   「インセンティブから控除」を選んだ経費は社員のインセンティブ残高から引かれるので、
+   会社の蓄積額には影響しない。
+--------------------------------------------------------------------- */
+function computeRetainedSummary(){
+  const employees        = state.adminEmployees || [];
+  const settlements      = state.adminSettlements || [];
+  const incentiveExpenses= (state.adminAnnualExpenses||[]).filter(e => e.funded_by === 'incentive');
+  const sum = (arr, f) => arr.reduce((s,x) => s + Number(f(x)||0), 0);
+
+  // 会社負担経費は年次精算の時点で分配対象額から引かれているため、
+  // 会社取り分(company_share)はすでに経費控除後の金額。ここで再度引くと二重控除になる。
+  // 表示用に、精算時に保存した会社負担経費(company_expense_cost)を並べて出す。
+  const perEmployee = employees.map(emp => {
+    const ss = settlements.filter(s => s.employee_id === emp.id);
+    return {
+      emp,
+      years:  ss.length,
+      profit: sum(ss, s => s.investment_profit),
+      reward: sum(ss, s => s.salary_cost),
+      cexp:   sum(ss, s => s.company_expense_cost),
+      tax:    sum(ss, s => s.tax_cost),
+      share:  sum(ss, s => s.company_share),
+    };
+  });
+
+  // ---- 年度ごとの推移(古い順に累計を積み上げ) ----
+  const yearKeys = [...new Set(settlements.map(s => s.fiscal_year_end))].filter(Boolean).sort();
+
+  let running = 0;
+  const yearData = yearKeys.map(y => {
+    const inYear = settlements.filter(s => s.fiscal_year_end === y);
+    const share  = sum(inYear, s => s.company_share);
+    const cexp   = sum(inYear, s => s.company_expense_cost);
+    running += share;
+    return { y, share, cexp, cumulative: running };
+  });
+
+  const totals = {
+    profit: sum(perEmployee, r => r.profit),
+    reward: sum(perEmployee, r => r.reward),
+    cexp:   sum(perEmployee, r => r.cexp),
+    tax:    sum(perEmployee, r => r.tax),
+    share:  sum(perEmployee, r => r.share),
+    incentiveExpense: sum(incentiveExpenses, e => e.amount),
+  };
+
+  return { perEmployee, yearData, totals };
 }
 
 function submitLossForm(){
