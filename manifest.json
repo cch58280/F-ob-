@@ -1,0 +1,14 @@
+{
+  "name": "会社管理 | 口座・経費・決算管理",
+  "short_name": "会社管理",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#F7F5F1",
+  "theme_color": "#1C2B39",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
